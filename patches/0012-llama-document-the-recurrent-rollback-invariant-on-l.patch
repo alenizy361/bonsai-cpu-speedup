@@ -1,0 +1,42 @@
+From 0fd8b1d072f96c1b6879cbe173351777c9954d76 Mon Sep 17 00:00:00 2001
+From: abdulaziz <alanziabdulaziz4@gmail.com>
+Date: Sat, 19 Sep 2026 06:30:45 +0300
+Subject: [PATCH 12/15] llama: document the recurrent rollback invariant on
+ llama_memory_seq_rm
+
+A micro-batch snapshots the state after each of its last min(T, K) - 1 tokens and
+never the state it started from (ops.cpp slot = n_tokens - 1 - t, in-place and
+gathered alike, upstream 1a07bfa included), so a partial removal of a sequence's
+tail is a rollback of n positions only while 1 <= n <= min(T - 1, n_snap) with T the
+token count of the sequence's last micro-batch: N single-token decodes followed by
+N positions back never had a snapshot to read and are refused since 317e4d0
+instead of reading a plane an older micro-batch wrote. State it on the API.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QrdPnP5KL449GsoWBZx52R
+---
+ include/llama.h | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/include/llama.h b/include/llama.h
+index 781a425..20fd015 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -751,6 +751,14 @@ extern "C" {
+     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
+     // p0 < 0     : [0,  p1]
+     // p1 < 0     : [p0, inf)
++    // Recurrent memory with rollback snapshots (n_rs_seq > 0): removing the tail [p0, inf) of a
++    // sequence is honoured as a rollback of n = pos_max - p0 + 1 positions only when
++    // 1 <= n <= min(T - 1, n_snap), where T is the token count of the sequence's last micro-batch
++    // and n_snap its snapshot budget (llama_memory_seq_rs_snapshots, default n_rs_seq): a micro-batch
++    // snapshots the state after each of its last min(T, n_rs_seq + 1) - 1 tokens and never the state
++    // it started from, so a rollback across earlier micro-batches (e.g. N single-token decodes, then
++    // N positions back) is refused rather than read from a stale plane. The rollback stays pending
++    // until the sequence's next decode consumes it; a second partial removal before that is refused
+     LLAMA_API bool llama_memory_seq_rm(
+             llama_memory_t mem,
+               llama_seq_id seq_id,
+-- 
+2.43.0
+

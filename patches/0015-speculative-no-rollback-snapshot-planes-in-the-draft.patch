@@ -1,0 +1,52 @@
+From 3ed7c4340d114c4e05c3aa5b7035b578e1bb7f8e Mon Sep 17 00:00:00 2001
+From: abdulaziz <alanziabdulaziz4@gmail.com>
+Date: Sat, 19 Sep 2026 06:30:45 +0300
+Subject: [PATCH 15/15] speculative: no rollback snapshot planes in the draft
+ context
+
+The draft context inherited n_rs_seq = draft.n_max from
+common_context_params_to_llama, so common_context_can_seq_rm classified a
+recurrent drafter as RS and the server / speculative-simple removed the drafted
+tail with a partial seq_rm (server-context.cpp:2997, speculative-simple.cpp:209)
+instead of restoring the checkpoint. Every drafter decodes its draft one token
+per step (speculative.cpp draft loop), so the memory never held that snapshot:
+on a6536c3 the draft context continued from a stale plane (garbage drafts after
+the first round, silently); since 317e4d0 the refusal would GGML_ABORT at
+server-context.cpp:2998.
+
+With n_rs_seq = 0 a recurrent drafter is classified FULL and takes the existing
+checkpoint path (update_dft before drafting, load_dft before the now no-op
+seq_rm), the only correct one; a KV-cache drafter (transformer, the qwen35 /
+nemotron-h MTP contexts, dspark) is classified PART by the same probe it already
+ran and ignores n_rs_seq, and the target keeps its window. Also drops K planes of
+recurrent state per cell from the draft context.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QrdPnP5KL449GsoWBZx52R
+---
+ common/speculative.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4de75a3..f8cdc37 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -3148,7 +3148,14 @@ common_speculative_init_result::common_speculative_init_result(
+     // the draft context holds as many tokens per sequence as the target context
+     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+ 
+-    // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
++    // no rollback snapshot planes in the draft context: every drafter decodes its draft one token per
++    // step (or drives a plain KV cache), and a recurrent memory snapshots only the tokens of a
++    // sequence's last micro-batch (see llama_memory_seq_rm), so the partial removal of a draft can
++    // never be honoured from a snapshot -- with planes it used to read a stale one; without them
++    // common_context_can_seq_rm classifies a recurrent drafter as FULL and the server /
++    // speculative-simple take the checkpoint path, the only correct one. A KV-cache drafter is
++    // classified PART as before; the target keeps its window (common_context_params_to_llama)
++    cparams.n_rs_seq  = 0;
+     cparams.ctx_other = ctx_tgt;
+ 
+     std::string model_path;
+-- 
+2.43.0
+

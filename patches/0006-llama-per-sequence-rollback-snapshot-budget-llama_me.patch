@@ -1,0 +1,250 @@
+From 44e4b09d9263e839a946009464cc312e2067449b Mon Sep 17 00:00:00 2001
+From: abdulaziz <alanziabdulaziz4@gmail.com>
+Date: Sat, 19 Sep 2026 05:27:49 +0300
+Subject: [PATCH 06/15] llama: per-sequence rollback snapshot budget
+ (llama_memory_seq_rs_snapshots)
+
+The recurrent memory widens its R/S tensors to (1 + n_rs_seq) planes and every
+ubatch writes min(T, n_rs_seq + 1) of them for every sequence, whether or not
+that sequence will ever roll back. Add a per-seq budget rs_n_snap in
+[0, n_rs_seq], default n_rs_seq (every existing caller keeps today's behaviour),
+settable through the new public API and forwarded by the hybrid memory:
+
+  - llama_memory_recurrent::seq_rm accepts a partial tail removal only up to the
+    seq's budget; a budget-0 seq refuses exactly like a memory with n_rs_seq == 0,
+    so a caller sees the FULL-type behaviour for that sequence.
+  - llama_memory_recurrent_context::get_n_snap() = max budget over the seqs of
+    the ubatch apply() just placed (n_rs_seq for the reserve context so the
+    compute buffers fit the largest graph, 0 without snapshots). Side-effect
+    free, so it is valid at graph build and again in can_reuse.
+
+Nothing resets the budget but the API (seq_rm / clear / state_read leave it),
+and no graph consumes it yet.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QrdPnP5KL449GsoWBZx52R
+---
+ include/llama.h                | 10 +++++++
+ src/llama-context.cpp          | 11 +++++++
+ src/llama-memory-hybrid.cpp    |  4 +++
+ src/llama-memory-hybrid.h      |  1 +
+ src/llama-memory-recurrent.cpp | 54 ++++++++++++++++++++++++++++++++--
+ src/llama-memory-recurrent.h   | 14 +++++++++
+ src/llama-memory.h             |  5 ++++
+ 7 files changed, 97 insertions(+), 2 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index deb1e12..781a425 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -757,6 +757,16 @@ extern "C" {
+                  llama_pos p0,
+                  llama_pos p1);
+ 
++    // Set the number of recurrent-state rollback snapshot planes (0..llama_n_rs_seq) that the memory
++    // may write for and roll back on the specified sequence. Default: llama_n_rs_seq (every plane).
++    // A sequence with budget 0 keeps a single state plane; partial removals of its tail (see
++    // llama_memory_seq_rm) are refused, exactly as with a context created with n_rs_seq = 0.
++    // Returns false if the memory has no recurrent state or the arguments are out of range
++    LLAMA_API bool llama_memory_seq_rs_snapshots(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++                  uint32_t n_snap);
++
+     // Copy all tokens that belong to the specified sequence to another sequence
+     // p0 < 0 : [0,  p1]
+     // p1 < 0 : [p0, inf)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cc8c004..a06fef3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4232,6 +4232,17 @@ bool llama_memory_seq_rm(
+     return mem->seq_rm(seq_id, p0, p1);
+ }
+ 
++bool llama_memory_seq_rs_snapshots(
++        llama_memory_t mem,
++          llama_seq_id seq_id,
++              uint32_t n_snap) {
++    if (!mem) {
++        return false;
++    }
++
++    return mem->seq_rs_snapshots(seq_id, n_snap);
++}
++
+ void llama_memory_seq_cp(
+         llama_memory_t mem,
+           llama_seq_id seq_id_src,
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 42c7381..099422d 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -149,6 +149,10 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+     return mem_attn->seq_rm(seq_id, p0, p1);
+ }
+ 
++bool llama_memory_hybrid::seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) {
++    return mem_recr->seq_rs_snapshots(seq_id, n_snap);
++}
++
+ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb..78fba3d 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -61,6 +61,7 @@ public:
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    bool seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index dc70452..d2e01b4 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -86,6 +86,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+     this->n_rs_seq = n_rs_seq;
+     rs_idx.assign(n_seq_max, 0);
++    rs_n_snap.assign(n_seq_max, n_rs_seq); // every seq keeps all planes unless the API lowers its budget
+ 
+     cells.clear();
+     cells.resize(mem_size);
+@@ -304,12 +305,13 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+         if (tail_id >= 0) {
+             auto & cell = cells[tail_id];
+ 
+-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
++            // partial rollback via per-token snapshot index, bounded by the seq's snapshot budget
++            // (rs_n_snap[seq_id] <= n_rs_seq; a budget of 0 refuses like a memory with n_rs_seq == 0)
+             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                 const llama_pos rollback = cell.pos - (p0 - 1);
+                 // pending rollback is single-use
+                 const bool pending = rs_idx[seq_id] != 0;
+-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
++                if (!pending && rollback >= 1 && rollback <= (llama_pos) rs_n_snap[seq_id]) {
+                     set_rs_idx(seq_id, (uint32_t) rollback);
+                     cell.pos = p0 - 1;
+                     return true;
+@@ -531,6 +533,24 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+     rs_idx[seq_id] = idx;
+ }
+ 
++bool llama_memory_recurrent::seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) {
++    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
++        LLAMA_LOG_ERROR("%s: invalid seq_id (%d) - larger than n_seq_max (%d)\n", __func__, seq_id, n_seq_max);
++        return false;
++    }
++
++    if (n_snap > n_rs_seq) {
++        LLAMA_LOG_ERROR("%s: snapshot budget (%u) larger than n_rs_seq (%u)\n", __func__, n_snap, n_rs_seq);
++        return false;
++    }
++
++    assert(n_seq_max == rs_n_snap.size());
++
++    rs_n_snap[seq_id] = n_snap;
++
++    return true;
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> ret;
+     for (const auto & [_, buf] : ctxs_bufs) {
+@@ -1422,3 +1442,33 @@ bool llama_memory_recurrent_context::rs_inplace_ok(uint32_t n_seqs) const {
+ 
+     return true;
+ }
++
++uint32_t llama_memory_recurrent_context::get_n_snap() const {
++    // no snapshot planes at all (n_rs_seq == 0): K = 1 regardless of the budgets
++    if (mem->n_rs_seq == 0) {
++        return 0;
++    }
++
++    // the reserve context sizes the compute buffers: keep the largest graph
++    if (is_full || ubatches.empty()) {
++        return mem->n_rs_seq;
++    }
++
++    // ubatches[i_next] is the ubatch apply() -> find_slot just placed; for an equal_seqs ubatch the
++    // seq ids of sequence set s are those of its first token
++    const auto & ubatch = ubatches[i_next];
++
++    uint32_t res = 0;
++
++    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
++        const uint32_t i = s*ubatch.n_seq_tokens;
++        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++            const llama_seq_id seq_id = ubatch.seq_id[i][j];
++            if (seq_id >= 0 && (size_t) seq_id < mem->rs_n_snap.size()) {
++                res = std::max(res, mem->rs_n_snap[seq_id]);
++            }
++        }
++    }
++
++    return res;
++}
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 78aa31d..91473a6 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -44,6 +44,7 @@ public:
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    bool seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+@@ -78,6 +79,12 @@ public:
+ 
+     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+ 
++    // per-seq rollback snapshot budget in [0, n_rs_seq] (llama_memory_seq_rs_snapshots): the number
++    // of snapshot planes a ubatch may write for the seq -- the graph writes K = 1 + the max over the
++    // ubatch's seqs (llama_memory_recurrent_context::get_n_snap) -- and the largest partial rollback
++    // seq_rm accepts for it. Defaults to n_rs_seq; only the API changes it (not seq_rm/clear/state_read)
++    std::vector<uint32_t> rs_n_snap;
++
+     // computed before each graph build
+     uint32_t n = 0;
+ 
+@@ -193,6 +200,13 @@ public:
+     // evaluated at graph build and again in can_reuse.
+     bool rs_inplace_ok(uint32_t n_seqs) const;
+ 
++    // rollback snapshot planes of the current ubatch: the GDN paths write K = 1 + get_n_snap()
++    // state planes per seq. It is the max of the per-seq budgets (mem->rs_n_snap) over the
++    // ubatch's seqs, n_rs_seq for the full (reserve) context so the compute buffers fit the
++    // largest graph, and 0 when the memory keeps no snapshots. Side-effect free (same rule as
++    // rs_inplace_ok): evaluated at graph build and again in can_reuse (part of the reuse key).
++    uint32_t get_n_snap() const;
++
+ private:
+     const llama_memory_status status;
+ 
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index db82539..6407dc4 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -108,6 +108,11 @@ struct llama_memory_i {
+     virtual void clear(bool data) = 0;
+ 
+     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
++
++    // number of rollback snapshot planes the memory may write for / roll back on this sequence
++    // (see llama_memory_seq_rs_snapshots); memories without recurrent state return false
++    virtual bool seq_rs_snapshots(llama_seq_id /*seq_id*/, uint32_t /*n_snap*/) { return false; }
++
+     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+     virtual void seq_keep(llama_seq_id seq_id) = 0;
+     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
+-- 
+2.43.0
+

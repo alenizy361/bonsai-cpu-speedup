@@ -1,0 +1,179 @@
+From 724056660af60fe882ef9e4f2e9d2205504d79e1 Mon Sep 17 00:00:00 2001
+From: abdulaziz <alanziabdulaziz4@gmail.com>
+Date: Sat, 19 Sep 2026 05:27:49 +0300
+Subject: [PATCH 07/15] gdn: derive the snapshot plane count K of a ubatch from
+ the seqs' budgets
+
+The delta-net state write paths took K = cparams.n_rs_seq + 1 for every
+ubatch. Take K = 1 + llama_memory_recurrent_context::get_n_snap() instead,
+recorded once per graph in llm_graph_input_rs::rs_n_snap (build_rs_inp_impl,
+so both the recurrent and the hybrid callers get it) and made part of the
+graph reuse key: at T = 1 the s_write_rows length is identical for K = 1 and
+K = 3 while the op params (ggml_gated_delta_net_cache), the number of
+conv-state copies and the fused-gate decision differ.
+
+A ubatch that contains a drafting seq (budget n_rs_seq) gets exactly today's
+K on every path -- in-place, gathered, rows -- identical topology, identical
+s_write_rows contents, identical op params: bit-identical scores and cache
+rows. A ubatch of opted-out seqs (budget 0) gets K = 1: one conv-state copy,
+a single S plane on the in-place path (the kernel writes no snapshot rows
+for K == 1), the !keep single-row copy on the gathered path and n_written = 1
+on the rows path -- also on the prompt ubatch and on the gathered transition
+ubatches, which is what bounds the per-slot residency to one plane.
+
+qwen35 keys fused_ok / the K1-only env / the Metal rows mode on K as well, so
+an opted-out ubatch builds node for node the graph the no-spec context
+builds (n_rs_seq == 0): the no-spec server becomes a usable md5 oracle for
+those requests. qwen35moe / qwen3next share build_recurrent_attn and keep
+today's K unless the new API is called.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QrdPnP5KL449GsoWBZx52R
+---
+ src/llama-graph.cpp           |  5 +++++
+ src/llama-graph.h             |  6 ++++++
+ src/models/delta-net-base.cpp | 24 ++++++++++++++++--------
+ src/models/qwen35.cpp         | 13 ++++++++++---
+ 4 files changed, 37 insertions(+), 11 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 002c599..569d13c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -422,6 +422,10 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
+     // was already updated by apply() -> find_slot before can_reuse runs
+     res &= rs_inplace == mctx_cur->rs_inplace_ok(params.ubatch.n_seqs);
+ 
++    // the snapshot plane count K = rs_n_snap + 1 is baked into the op params
++    // (and the s_write_rows check above cannot see it at T = 1)
++    res &= rs_n_snap == mctx_cur->get_n_snap();
++
+     return res;
+ }
+ 
+@@ -3579,6 +3583,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+     inp->rs_z = mctx_cur->get_rs_z();
+ 
+     inp->rs_inplace = mctx_cur->rs_inplace_ok(n_seqs);
++    inp->rs_n_snap  = mctx_cur->get_n_snap();
+ 
+     return inp;
+ }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index c3b7e13..d87d3c7 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -350,6 +350,12 @@ public:
+     // update the cache rows in place (rs_inplace_ok); part of the reuse key
+     bool rs_inplace = false;
+ 
++    // rollback snapshot planes of this graph's ubatch: the GDN paths write
++    // K = rs_n_snap + 1 state planes per seq (get_n_snap). Part of the reuse
++    // key: at T = 1 the s_write_rows length is the same for every K while the
++    // op params, the conv-state copies and the fused-gate choice differ
++    uint32_t rs_n_snap = 0;
++
+     const llama_memory_recurrent_context * mctx;
+ 
+     // used in view offsets, need to match for valid graph reuse
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index 2679967..4aef1ca 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -481,7 +481,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+ 
+     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
+ 
+-    if (cparams.n_rs_seq == 0) {
++    // snapshot planes of this ubatch: K = 1 + the rollback budget of its seqs
++    // (n_rs_seq + 1 when a drafting seq is present, 1 for a ubatch of opted-out
++    // seqs and for a memory without snapshots -- the graph the no-spec context builds)
++    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
++
++    if (K == 1) {
+         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
+         const int64_t s_slot = 0;
+ 
+@@ -503,8 +508,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+         // [TAG_RECURRENT_ROLLBACK_SPLITS]
+         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
+         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
+-
+-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
++        //   (K <= n_rs_seq + 1, so the guarantee covers every budget)
+ 
+         for (int64_t t = 1; t <= K; ++t) {
+             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+@@ -552,7 +556,13 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t n_seqs       = v->ne[3];
+     const int64_t n_seq_tokens = q->ne[2];
+ 
+-    const bool keep = cparams.n_rs_seq > 0;
++    // snapshot planes of this ubatch (see build_conv_state): every state write
++    // path below derives its plane count from K, so a ubatch of opted-out seqs
++    // (K == 1) touches plane 0 only -- also on the prompt ubatch and on the
++    // gathered transition path
++    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
++
++    const bool keep = K > 1;
+ 
+     GGML_ASSERT(state_rows == nullptr || keep || state_inplace); // Metal rows mode is a ring-path optimization
+     GGML_ASSERT(!state_inplace || state_rows != nullptr);
+@@ -567,9 +577,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         // carries the attention scores only: no gather, no dst state planes, no
+         // write-back copy. Same float instruction sequence on the same inputs as
+         // the paths below, so the outputs and the resulting cache rows are
+-        // bit-identical (tests/test-gdn-inplace.cpp).
+-        const int64_t K = cparams.n_rs_seq + 1;
+-
++        // bit-identical (tests/test-gdn-inplace.cpp). With K == 1 the kernel
++        // writes no snapshot rows at all.
+         const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+         ggml_tensor * gg = raw ? gdn_raw_alpha : g;
+         ggml_tensor * bb = raw ? gdn_raw_beta  : b;
+@@ -614,7 +623,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     }
+ 
+     const int64_t D = S_v * S_v * H_v;
+-    const int64_t K = cparams.n_rs_seq + 1;
+ 
+     const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+     ggml_tensor * gg = raw ? gdn_raw_alpha : g;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 073a6e9..38552a4 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -490,10 +490,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     //    in supports_op, which would silently move the whole recurrent op to CPU.
+     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
+ 
++    // snapshot planes of this ubatch: K = n_rs_seq + 1 when a drafting seq is in
++    // it, 1 for a ubatch of opted-out seqs (llama_memory_seq_rs_snapshots) and
++    // for a context without snapshots. Keyed on K rather than cparams.n_rs_seq
++    // so an opted-out ubatch builds node for node the graph the no-spec context
++    // builds (single conv-state copy, plane 0 only, fused gates by the probes).
++    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
++
+     // the in-place op always runs the fused kernel: only take it where the legacy
+     // path runs the fused kernel too (the ring path always does; the K == 1 path
+     // only with the fused_gdn_* probes on), so the A/B stays bit-identical
+-    const bool fused_ok = cparams.n_rs_seq > 0 || (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
++    const bool fused_ok = K > 1 || (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
+ 
+     // GGML_GDN_INPLACE_K1_ONLY=1 restricts the in-place path to K == 1 (no
+     // speculation); by default the MTP speculative mode (K = n_rs_seq + 1) takes
+@@ -503,9 +510,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     static const bool gdn_inplace_k1_only_env = getenv("GGML_GDN_INPLACE_K1_ONLY") != nullptr;
+ 
+     const bool gdn_state_inplace    = gdn_state_rows_env && gdn_state_inplace_dev_ok && inp->rs_inplace && fused_ok &&
+-                                      (cparams.n_rs_seq == 0 || !gdn_inplace_k1_only_env);
++                                      (K == 1 || !gdn_inplace_k1_only_env);
+     const bool gdn_state_rows_metal = gdn_state_rows_env && gdn_state_rows_dev_ok && !gdn_state_inplace_dev_ok &&
+-                                      cparams.n_rs_seq > 0;
++                                      K > 1;
+     const bool gdn_state_rows       = gdn_state_inplace || gdn_state_rows_metal;
+ 
+     ggml_tensor * state;
+-- 
+2.43.0
+

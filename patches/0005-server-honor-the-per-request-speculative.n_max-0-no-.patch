@@ -1,0 +1,157 @@
+From 89f8a273efb1c818e40779d285e7eec803b4883f Mon Sep 17 00:00:00 2001
+From: abdulaziz <alanziabdulaziz4@gmail.com>
+Date: Sat, 19 Sep 2026 05:24:05 +0300
+Subject: [PATCH 05/15] server: honor the per-request speculative.n_max (0 = no
+ drafting for the request)
+
+The "speculative.n_max" request field was parsed inside an `#if 0` block and
+nothing in the server read task->params.speculative, so every generating slot
+drafted the global --spec-draft-n-max tokens whether or not the request asked
+for it. With draft-mtp the per-slot token counts then differed step by step
+(1 + d, d in 0..n_max), which split_equal(n_keep_tail = n_rs_seq + 1) cannot
+batch: N "opted-out" slots decoded as up to N ubatches per step instead of one.
+
+Move only the n_max field out of the `#if 0` (n_min/p_min/type/ngram_* stay
+disabled) and record the policy per slot at task launch:
+
+  - spec_enabled = can_speculate() && n_max != 0 -> get_n_draft_max() returns 0
+    for an opted-out slot: dp.drafting stays false, no spec checkpoint update,
+    handle_last_sampled_token adds exactly one token, post_decode samples it
+    normally and the verify loop never sees the slot. N such slots with
+    consecutive ids form one N x 1 ubatch (remaining == 0 satisfies the tail
+    rule), the same call shape the no-spec server makes.
+  - spec_n_max clamps the draft of a request that sends 0 < n_max; a request
+    without the field carries the server-wide value, at which the MTP loop
+    stops anyway, so its draft, batch, checkpoints and rollbacks are unchanged
+    byte for byte.
+
+Mixed steps split as today: a drafting slot contributes 1 + d tokens and is
+emitted in its own equal-length ubatch (tail rule), the opted-out run forms a
+T = 1 ubatch.
+
+LLAMA_SERVER_SPEC_MULTISLOT=0 restores the previous policy (every slot drafts,
+the request field is ignored).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QrdPnP5KL449GsoWBZx52R
+---
+ tools/server/server-context.cpp | 41 +++++++++++++++++++++++++++++++++
+ tools/server/server-schema.cpp  | 12 ++++++----
+ 2 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7..680359d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -212,6 +212,11 @@ struct server_slot {
+     common_prompt_checkpoint spec_ckpt;
+     bool spec_is_replay = false;
+ 
++    // per-request drafting policy, set in launch_slot_with_task from "speculative.n_max"
++    // (LLAMA_SERVER_SPEC_MULTISLOT=0 restores the server-wide policy: every slot drafts, no cap)
++    bool spec_enabled = false; // false: the slot never drafts -> one token per step, single state plane
++    int  spec_n_max   = -1;    // per-request draft cap; < 0: no per-request limit
++
+     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
+     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
+     std::unique_ptr<const server_task> task;
+@@ -441,6 +446,11 @@ struct server_slot {
+             return 0;
+         }
+ 
++        // the request opted out of drafting ("speculative.n_max": 0)
++        if (!spec_enabled) {
++            return 0;
++        }
++
+         // determine the max draft that fits the current slot state
+         // note: slot.prompt is not yet expanded with the `id` token sampled above
+         //       also, need to leave space for 1 extra token to allow context shifts
+@@ -450,6 +460,12 @@ struct server_slot {
+             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+         }
+ 
++        // per-request cap; a request without the field carries the server-wide n_max, at which the
++        // draft implementation stops anyway, so the clamp is a no-op for it
++        if (spec_n_max > 0) {
++            n_draft_max = std::min(n_draft_max, spec_n_max);
++        }
++
+         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+ 
+         return n_draft_max;
+@@ -862,6 +878,11 @@ private:
+     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
+     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+ 
++    // env: LLAMA_SERVER_SPEC_MULTISLOT (default 1). 0 restores the server-wide speculative policy:
++    // every slot drafts with the global n_max, the per-request "speculative.n_max" is ignored and
++    // every sequence keeps the full rollback snapshot budget
++    bool spec_multislot = true;
++
+     int n_empty_consecutive = 0;
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+@@ -1258,6 +1279,15 @@ private:
+             }
+         }
+ 
++        {
++            const char * LLAMA_SERVER_SPEC_MULTISLOT = getenv("LLAMA_SERVER_SPEC_MULTISLOT");
++            spec_multislot = LLAMA_SERVER_SPEC_MULTISLOT ? atoi(LLAMA_SERVER_SPEC_MULTISLOT) != 0 : true;
++
++            if (!spec_multislot) {
++                SRV_WRN("%s\n", "LLAMA_SERVER_SPEC_MULTISLOT = 0: per-request \"speculative.n_max\" is ignored, every slot drafts");
++            }
++        }
++
+         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
+         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
+         {
+@@ -1719,6 +1749,17 @@ private:
+ 
+         slot.task = std::make_unique<const server_task>(std::move(task));
+ 
++        // per-request drafting policy: "speculative.n_max": 0 opts the request out of speculative
++        // decoding, so the slot adds exactly one token per step and N such slots decode as one
++        // N x 1 ubatch (the shape the no-spec server decodes). A request without the field keeps the
++        // server-wide n_max -> the unchanged drafting path. The schema rejects negative values.
++        {
++            const int n_max_req = slot.task->params.speculative.draft.n_max;
++
++            slot.spec_enabled = slot.can_speculate() && (!spec_multislot || n_max_req != 0);
++            slot.spec_n_max   = spec_multislot ? n_max_req : -1;
++        }
++
+         slot.state = slot.task->is_child()
+             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
+             : SLOT_STATE_STARTED;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 64b9251..dca2dbe 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -194,13 +194,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     // Speculative decoding params
+     //
+ 
+-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
+-#if 0
+-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
++    // per-request draft cap (draft-model based methods). 0 opts the request out of drafting: the
++    // slot then adds exactly one token per step and batches with the other non-drafting slots
++    // (server_slot::spec_enabled). Without the field the request inherits the server-wide
++    // --spec-draft-n-max (params_base), i.e. the unchanged drafting path.
+     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
+         ->set_hard_limits(0, INT32_MAX)
+-        ->set_desc("Maximum number of tokens to draft during speculative decoding"));
++        ->set_desc("Maximum number of tokens to draft during speculative decoding (0 = no drafting for this request)"));
+ 
++    // TODO: to keep things simple, we disable the remaining speculative parameter adjustments for now
++#if 0
++    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
+         ->set_hard_limits(0, INT32_MAX)
+         ->set_desc("Minimum number of draft tokens to use for speculative decoding");
+-- 
+2.43.0
+

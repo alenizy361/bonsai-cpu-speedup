@@ -1,0 +1,54 @@
+From fd9a0af1ae185052fa8b3fa51c5f2858e109c851 Mon Sep 17 00:00:00 2001
+From: abdulaziz <alanziabdulaziz4@gmail.com>
+Date: Sat, 19 Sep 2026 05:30:51 +0300
+Subject: [PATCH 08/15] server: give an opted-out slot a rollback snapshot
+ budget of 0
+
+At task launch, right after the drafting policy is fixed, set the slot's
+sequence budget on the target memory: llama_n_rs_seq planes for a drafting
+slot (today's K on every ubatch it takes part in), 0 for a slot whose request
+sent "speculative.n_max": 0. Such a slot decodes with K = 1 -- one conv-state
+copy, plane 0 only on the prompt ubatch, the generation ubatches and the
+gathered transition ubatches -- node for node the graph the no-spec server
+builds, so its residency is one S plane plus the prompt-end checkpoint that
+both servers keep.
+
+The refusal that a budget of 0 adds to llama_memory_seq_rm is unreachable
+from the server for these slots: every partial tail removal it issues comes
+from the verify loop (non-empty spec_draft only); the prompt-reuse path
+resets or restores a checkpoint and then removes from cell.pos + 1, the
+cache-reuse and context-shift ranges end at or before cell.pos, and rm_all
+never enters the partial branch -- the same calls the FULL-type no-spec
+server makes for every slot. A slot that inherits a pending rollback index
+from an earlier drafting request reads a fully written plane (covered by
+test-gdn-inplace). The MTP draft context on qwen35 holds a plain KV cache
+and needs no call. LLAMA_SERVER_SPEC_MULTISLOT=0 keeps every budget at
+n_rs_seq.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QrdPnP5KL449GsoWBZx52R
+---
+ tools/server/server-context.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 680359d..db0c0e8 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1758,6 +1758,13 @@ private:
+ 
+             slot.spec_enabled = slot.can_speculate() && (!spec_multislot || n_max_req != 0);
+             slot.spec_n_max   = spec_multislot ? n_max_req : -1;
++
++            // rollback snapshot budget of the slot's sequence (recurrent memories; a no-op for the
++            // others): every plane for a drafting slot (K = n_rs_seq + 1, the unchanged graph), none
++            // for an opted-out slot (K = 1: plane 0 only, the graph the no-spec server builds). Set
++            // before the slot's first ubatch. The MTP draft context holds a plain KV cache, so the
++            // call goes to ctx_tgt only.
++            llama_memory_seq_rs_snapshots(llama_get_memory(ctx_tgt), slot.id, slot.spec_enabled ? llama_n_rs_seq(ctx_tgt) : 0);
+         }
+ 
+         slot.state = slot.task->is_child()
+-- 
+2.43.0
+
