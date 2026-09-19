@@ -1,0 +1,2948 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 4de75a3..f8cdc37 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -3148,7 +3148,14 @@ common_speculative_init_result::common_speculative_init_result(
+     // the draft context holds as many tokens per sequence as the target context
+     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+ 
+-    // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
++    // no rollback snapshot planes in the draft context: every drafter decodes its draft one token per
++    // step (or drives a plain KV cache), and a recurrent memory snapshots only the tokens of a
++    // sequence's last micro-batch (see llama_memory_seq_rm), so the partial removal of a draft can
++    // never be honoured from a snapshot -- with planes it used to read a stale one; without them
++    // common_context_can_seq_rm classifies a recurrent drafter as FULL and the server /
++    // speculative-simple take the checkpoint path, the only correct one. A KV-cache drafter is
++    // classified PART as before; the target keeps its window (common_context_params_to_llama)
++    cparams.n_rs_seq  = 0;
+     cparams.ctx_other = ctx_tgt;
+ 
+     std::string model_path;
+diff --git a/examples/rs-rollback/rs-rollback-multi.cpp b/examples/rs-rollback/rs-rollback-multi.cpp
+index 2c810cf..a65f7ea 100644
+--- a/examples/rs-rollback/rs-rollback-multi.cpp
++++ b/examples/rs-rollback/rs-rollback-multi.cpp
+@@ -6,11 +6,20 @@
+ // that class of bug at all.
+ //
+ //   pass A (reference): run S sequences concurrently, no rollback.
+-//   pass B (rollback):  identical, but sequence 0 periodically over-generates R
+-//                       tokens which are then seq_rm()'d away and re-generated.
++//   pass B (rollback):  identical, but sequence 0 periodically decodes its next
++//                       token together with R draft tokens as ONE ubatch (the
++//                       server's verify shape) and then seq_rm()s the R draft
++//                       positions away.
+ //
+ // PASS requires every sequence -- including the untouched ones -- to emit
+ // exactly the reference token stream.
++//
++// The rollback stays inside the verify ubatch on purpose: a ubatch snapshots the
++// state after each of its last min(T, K) - 1 tokens and never the state it
++// started from, so a rollback across single-token steps is refused. At a
++// rollback step sequence 0's logits come from an (R + 1)-token ubatch and the
++// other sequences decode without it, so a mismatch exactly there can in rare
++// near-tie cases be matmul rounding rather than a snapshot bug.
+ #include "llama.h"
+ 
+ #include <cstdio>
+@@ -153,8 +162,62 @@ int main(int argc, char ** argv) {
+             out[s].push_back(greedy_ith(ctx, vocab, batch.n_tokens - 1));
+         }
+ 
++        const int n_vocab_run = llama_vocab_n_tokens(vocab);
++
++        // invariant at the top of every iteration: out[s].back() is sampled-but-not-yet-decoded
+         int since = 0;
+         while ((int) out[0].size() < n_predict) {
++            if (with_rollback && since >= stride && (int) out[0].size() + rewind + 2 < n_predict) {
++                n_rollbacks++;
++                // seq 0 alone takes a verify-style step: its pending token plus `rewind`
++                // draft tokens as ONE ubatch (logits for the pending token's row only),
++                // then the drafts are dropped. A ubatch snapshots the state after each
++                // of its last min(T, K) - 1 tokens and never the state it started from,
++                // so with T = rewind + 1 the rollback of `rewind` positions is the
++                // largest this ubatch supports and lands on the state after the pending
++                // token -- needs n_rs_seq >= rewind. The drafts' content is irrelevant.
++                const int npos0 = npos[0];
++                batch.n_tokens  = 0;
++                for (int r = 0; r <= rewind; r++) {
++                    const llama_token t = r == 0 ? out[0].back() : (llama_token) ((out[0].back() + 7*r + 1) % n_vocab_run);
++                    batch.token[r]     = t;
++                    batch.pos[r]       = npos0 + r;
++                    batch.n_seq_id[r]  = 1;
++                    batch.seq_id[r][0] = 0;
++                    batch.logits[r]    = r == 0;
++                    batch.n_tokens++;
++                }
++                if (llama_decode(ctx, batch)) {
++                    fprintf(stderr, "decode(verify) failed\n");
++                    return false;
++                }
++
++                const llama_pos keep = npos0 + 1;
++                if (!llama_memory_seq_rm(mem, 0, keep, -1)) {
++                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d npos0=%d rewind=%d\n", keep, npos0 + rewind + 1, rewind);
++                    return false;
++                }
++                npos[0] = keep;
++                out[0].push_back(greedy_ith(ctx, vocab, 0));
++
++                // the other sequences take their ordinary single-token step
++                std::vector<std::pair<int, llama_token>> others;
++                for (int s = 1; s < n_seqs; s++) {
++                    others.push_back({ s, out[s].back() });
++                }
++                if (!others.empty()) {
++                    if (!submit(others)) {
++                        fprintf(stderr, "decode(step) failed\n");
++                        return false;
++                    }
++                    for (int s = 1; s < n_seqs; s++) {
++                        out[s].push_back(greedy_ith(ctx, vocab, s - 1));
++                    }
++                }
++                since = 0;
++                continue;
++            }
++
+             // one token per sequence, all in one batch
+             std::vector<std::pair<int, llama_token>> items;
+             for (int s = 0; s < n_seqs; s++) {
+@@ -168,36 +231,6 @@ int main(int argc, char ** argv) {
+                 out[s].push_back(greedy_ith(ctx, vocab, s));
+             }
+             since++;
+-
+-            if (with_rollback && since >= stride && (int) out[0].size() + rewind + 2 < n_predict) {
+-                n_rollbacks++;
+-                // seq 0 alone over-generates, then discards
+-                for (int r = 0; r < rewind; r++) {
+-                    std::vector<std::pair<int, llama_token>> one = {
+-                        { 0, out[0].back() }
+-                    };
+-                    if (!submit(one)) {
+-                        fprintf(stderr, "decode(draft) failed\n");
+-                        return false;
+-                    }
+-                    out[0].push_back(greedy_ith(ctx, vocab, 0));
+-                }
+-                for (int r = 0; r < rewind; r++) {
+-                    out[0].pop_back();
+-                }
+-
+-                // invariant: out[s].back() is sampled-but-not-yet-decoded. The
+-                // drafts occupied positions [npos0 - rewind, npos0), and that
+-                // range also covers the decode of the still-pending token, so
+-                // discarding it restores the exact pre-draft state -- no replay.
+-                const llama_pos keep = npos[0] - rewind;
+-                if (!llama_memory_seq_rm(mem, 0, keep, -1)) {
+-                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d npos0=%d rewind=%d\n", keep, npos[0], rewind);
+-                    return false;
+-                }
+-                npos[0] = keep;
+-                since   = 0;
+-            }
+         }
+ 
+         llama_batch_free(batch);
+diff --git a/examples/rs-rollback/rs-rollback.cpp b/examples/rs-rollback/rs-rollback.cpp
+index c03a72a..0f9be82 100644
+--- a/examples/rs-rollback/rs-rollback.cpp
++++ b/examples/rs-rollback/rs-rollback.cpp
+@@ -1,16 +1,25 @@
+-// Correctness harness for the recurrent-state snapshot ring (n_rs_seq > 0).
++// Correctness harness for the recurrent-state snapshot planes (n_rs_seq > 0).
+ //
+-// A forward-only generation never reads the snapshot slots back, so it cannot
++// A forward-only generation never reads the snapshot planes back, so it cannot
+ // catch a bad snapshot write. This does:
+ //
+ //   pass A (reference): greedily generate N tokens straight through.
+-//   pass B (rollback):  generate the same N tokens, but every S tokens
+-//                       over-generate by R, then llama_memory_seq_rm() those R
+-//                       positions away and re-generate them.
++//   pass B (rollback):  generate the same N tokens, but every S accepted tokens
++//                       decode the next accepted token together with R draft
++//                       tokens as ONE ubatch (the server's verify shape), then
++//                       llama_memory_seq_rm() the R draft positions away.
+ //
+ // Pass B only lands on the same tokens if the state restored from the snapshot
+-// ring is exactly the state that produced them the first time. Any error in the
++// plane is exactly the state after the accepted token. Any error in the
+ // conv-window or SSM snapshot write shows up as a token mismatch.
++//
++// The rollback stays inside the verify ubatch on purpose: a ubatch snapshots the
++// state after each of its last min(T, K) - 1 tokens and never the state it
++// started from, so a rollback across single-token steps is refused. Right after
++// a rollback step the accepted token's logits come from an (R + 1)-token ubatch
++// instead of a single-token one; a mismatch exactly there can in rare near-tie
++// cases be matmul rounding rather than a snapshot bug -- the first-mismatch
++// index tells.
+ #include "llama.h"
+ 
+ #include <cstdio>
+@@ -39,7 +48,7 @@ int main(int argc, char ** argv) {
+     int         n_predict = 128;
+     int         stride    = 16;  // roll back every `stride` accepted tokens
+     int         rewind    = 4;   // how many tokens to discard and re-generate
+-    int         n_rs_seq  = 8;   // snapshot ring depth; must be >= rewind + 1
++    int         n_rs_seq  = 8;   // snapshot planes per seq; must be >= rewind
+ 
+     for (int i = 1; i < argc; i++) {
+         if (!strcmp(argv[i], "-m") && i + 1 < argc) {
+@@ -98,49 +107,54 @@ int main(int argc, char ** argv) {
+         }
+         int n_pos = n_prompt;
+ 
++        const int n_vocab = llama_vocab_n_tokens(vocab);
++
+         int since = 0;
+         while ((int) out.size() < n_predict) {
+             llama_token tok = greedy(ctx, vocab);
+             out.push_back(tok);
+-
+-            batch = llama_batch_get_one(&tok, 1);
+-            if (llama_decode(ctx, batch)) {
+-                fprintf(stderr, "decode failed\n");
+-                return false;
+-            }
+-            n_pos++;
+             since++;
+ 
+             if (with_rollback && since >= stride && (int) out.size() + rewind < n_predict) {
+                 n_rollbacks++;
+-                // over-generate `rewind` tokens, then throw them away
+-                for (int r = 0; r < rewind; r++) {
+-                    llama_token t = greedy(ctx, vocab);
+-                    batch         = llama_batch_get_one(&t, 1);
+-                    if (llama_decode(ctx, batch)) {
+-                        fprintf(stderr, "decode(draft) failed\n");
+-                        return false;
+-                    }
+-                    n_pos++;
++                // Verify-style step: decode the accepted token together with `rewind`
++                // draft tokens as ONE ubatch (logits for the accepted token's row only),
++                // then drop the drafts. A ubatch snapshots the state after each of its
++                // last min(T, K) - 1 tokens and never the state it started from, so with
++                // T = rewind + 1 a rollback of `rewind` positions is the largest this
++                // ubatch supports and lands on the state after the accepted token --
++                // needs n_rs_seq >= rewind. The drafts' content is irrelevant.
++                llama_batch vb = llama_batch_init(rewind + 1, 0, 1);
++                for (int r = 0; r <= rewind; r++) {
++                    vb.token[r]     = r == 0 ? tok : (llama_token) ((tok + 7*r + 1) % n_vocab);
++                    vb.pos[r]       = n_pos + r;
++                    vb.n_seq_id[r]  = 1;
++                    vb.seq_id[r][0] = 0;
++                    vb.logits[r]    = r == 0;
++                }
++                vb.n_tokens = rewind + 1;
++                const bool ok_verify = llama_decode(ctx, vb) == 0;
++                llama_batch_free(vb);
++                if (!ok_verify) {
++                    fprintf(stderr, "decode(verify) failed\n");
++                    return false;
+                 }
+-                // Drop the drafts AND the last accepted token in one go, then
+-                // re-decode the accepted token so the logits are valid again.
+-                // This forces the state to be restored from a snapshot taken
+-                // (rewind + 1) steps back -- needs n_rs_seq >= rewind + 1.
+-                const llama_pos keep = n_pos - rewind - 1;
++
++                const llama_pos keep = n_pos + 1;
+                 if (!llama_memory_seq_rm(mem, 0, keep, -1)) {
+-                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d n_pos=%d rewind=%d\n", keep, n_pos, rewind);
++                    fprintf(stderr, "ROLLBACK REFUSED: keep=%d n_pos=%d rewind=%d\n", keep, n_pos + rewind + 1, rewind);
+                     return false;
+                 }
+                 n_pos = keep;
+-
+-                batch = llama_batch_get_one(&out.back(), 1);
++                since = 0;
++                // the next greedy() reads the accepted token's logits, the batch's only output row
++            } else {
++                batch = llama_batch_get_one(&tok, 1);
+                 if (llama_decode(ctx, batch)) {
+-                    fprintf(stderr, "decode(replay) failed\n");
++                    fprintf(stderr, "decode failed\n");
+                     return false;
+                 }
+                 n_pos++;
+-                since = 0;
+             }
+         }
+         llama_free(ctx);
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index d875a15..7d518ed 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2620,6 +2620,31 @@ extern "C" {
+             struct ggml_tensor  * rows,
+             int                   n_snap_slots);
+ 
++    // cache-writing form (CPU backend only): like ggml_gated_delta_net_rows, but
++    // the op MUTATES `states` instead of returning state planes -- the result is
++    // the attention scores only, [S_v*H_v, n_tokens*n_seqs]. For sequence i the
++    // kernel reads cache row rows_in[i] (I32, n_seqs entries), updates the live
++    // state in place in row rows_out[0*n_seqs + i] (I64, min(n_tokens, K)*n_seqs
++    // entries; no copy at all when rows_in[i] == rows_out[i]) and writes snapshot
++    // slot s (state s tokens back) for s in 1..min(n_tokens, K)-1 straight into
++    // row rows_out[s*n_seqs + i]. The caller guarantees that rows_in[i] and every
++    // rows_out[s*n_seqs + i] are planes of ONE cell (row % mem_size equal, checked
++    // by the kernel) and that the cells of different sequences are pairwise
++    // distinct, so no work unit ever reads a row another unit writes. Removes the
++    // gather, the dst state planes and the write-back copy from recurrent decode.
++    GGML_API struct ggml_tensor * ggml_gated_delta_net_cache(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * g,
++            struct ggml_tensor  * beta,
++            struct ggml_tensor  * states,   // 2D cache view [S_v*S_v*H_v, n_rows], mutated
++            struct ggml_tensor  * rows_in,  // I32 [n_seqs]
++            struct ggml_tensor  * rows_out, // I64 [min(n_tokens, K)*n_seqs]
++            int                   n_snap_slots,
++            int                   mem_size);
++
+     // fold the per-head gate activations into a gated_delta_net op (scalar gate only):
+     //   beta -> sigmoid(beta),  g -> a[h] * softplus(g + dt_bias[h])
+     // dt_bias and a are F32 with H_v elements; removes four elementwise ops per layer
+diff --git a/ggml/src/ggml-cpu/arch-fallback.h b/ggml/src/ggml-cpu/arch-fallback.h
+index d283c2e..1edbb20 100644
+--- a/ggml/src/ggml-cpu/arch-fallback.h
++++ b/ggml/src/ggml-cpu/arch-fallback.h
+@@ -95,7 +95,6 @@
+ #define ggml_gemm_pq2_0_4x8_q8_0_generic ggml_gemm_pq2_0_4x8_q8_0
+ #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
+ // PTQ1_0 currently has only the generic vec_dot; alias it here until a SIMD version lands
+-#define ggml_vec_dot_ptq1_0_q8_0_generic ggml_vec_dot_ptq1_0_q8_0
+ // quants.c
+ #define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
+ // repack.cpp
+diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
+index 7fc8e77..161c048 100644
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -574,34 +574,51 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+ 
+     float sumf = 0.0f;
+ 
+-#if (defined(__AVX512VNNI__) && defined(__AVX512VL__)) || defined(__AVXVNNI__)
+-    // AVX-VNNI / AVX-512-VNNI: unpack 2-bit codes c in {0,1,2,3} (value = c-1), then
+-    // dot((c-1), qy) = dpbusd(c, qy) - dpbusd(1, qy). Group 128 = four q8_0 sub-blocks.
+-    const __m256i ones   = _mm256_set1_epi8(1);
+-    const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
+-    const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
+-    const __m256i mul    = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1); // <<(6-2c)
+-    const __m256i three  = _mm256_set1_epi16(3);
++#if defined(__AVX2__)
++    // AVX2 (+AVX-VNNI / AVX-512-VNNI dot when available). 2-bit codes c in {0,1,2,3}
++    // (value = c-1); byte b of a 32-weight sub-block holds weights 4b..4b+3, LSB pair first.
++    // Group 128 = four q8_0 sub-blocks.
++    //
++    // Unpack: broadcast the 8 code bytes into all four 64-bit lanes, shift lane j right by
++    // 2j and mask with 3 -> byte [8j+b] = code of weight 4b+j (3 instructions, no
++    // per-sub-block horizontal sums, which dominated the previous kernel: 2 hsums per 32
++    // weights and a scalar float chain). The q8 activations are permuted once per sub-block
++    // to the same [8j+b] order, and the int32 partial sums stay vectorized; the block scale
++    // is applied with one FMA and there is a single horizontal sum at the very end.
++    const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
++    const __m256i mask3   = _mm256_set1_epi8(3);
++    const __m256i ones_8  = _mm256_set1_epi8(1);
++#if !defined(GGML_DPBUSD_256)
++    const __m256i ones_16 = _mm256_set1_epi16(1);
++#endif
++    // weight order [4b+j] -> code order [8j+b]: in-lane 4x4 byte transpose, then interleave
++    // the two 128-bit lanes dword-wise (lo j0, hi j0, lo j1, hi j1, ...).
++    const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15,
++                                             0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
++    const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
++    __m256 acc = _mm256_setzero_ps();
+     for (int i = 0; i < nb; i++) {
+         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+-        float sumi = 0.0f;
++        __m256 acc_block = _mm256_setzero_ps();
+         for (int k = 0; k < 4; k++) {
+             const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+-            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+-            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
+-            const __m128i src = _mm_loadl_epi64((const __m128i *) &x[i].qs[k * 8]); // 8 bytes
+-            const __m256i rep = _mm256_set_m128i(_mm_shuffle_epi8(src, idxhi), _mm_shuffle_epi8(src, idxlo));
+-            __m256i r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
+-            __m256i r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
+-            r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
+-            r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
+-            __m256i codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8);
+-            const int dp = hsum_i32_8(GGML_DPBUSD_256(_mm256_setzero_si256(), codes, qy));
+-            const int sy = hsum_i32_8(GGML_DPBUSD_256(_mm256_setzero_si256(), ones,  qy));
+-            sumi += d1 * (float)(dp - sy);
++            const __m256i qy  = _mm256_loadu_si256((const __m256i *) yb->qs);
++            const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
++            int64_t xq; memcpy(&xq, &x[i].qs[k * 8], sizeof(xq));
++            const __m256i codes = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
++            // sum((c-1)*qy) = sum(c*qy) - sum(qy), per 32-bit lane (4 products each)
++#if defined(GGML_DPBUSD_256)
++            const __m256i s32 = _mm256_sub_epi32(GGML_DPBUSD_256(_mm256_setzero_si256(), codes,  qyp),
++                                                 GGML_DPBUSD_256(_mm256_setzero_si256(), ones_8, qyp));
++#else
++            const __m256i s32 = _mm256_sub_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(codes,  qyp), ones_16),
++                                                 _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, qyp), ones_16));
++#endif
++            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d)), _mm256_cvtepi32_ps(s32), acc_block);
+         }
+-        sumf += d0 * sumi;
++        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+     }
++    sumf = hsum_float_8(acc);
+ #else
+     for (int i = 0; i < nb; i++) {
+         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+@@ -4182,3 +4199,156 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
+     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+ #endif
+ }
++
++// ggml_vec_dot_ptq1_0_q8_0 — AVX2 / AVX-VNNI kernel for PrismML's PTQ1_0 (base-3 ternary, group 128). v2.
++//
++// v1 unpacked the 128 codes into a stack buffer with 16/8/1-byte stores and re-read them with 32-byte
++// loads: a store-forwarding failure on every load, four per block, ~210 M blocks per token. It measured
++// 0.96 tok/s against 4.13 for PQ2_0. v2 never touches memory between unpack and dot: every 32-code group
++// is assembled in registers, and the five trit rounds are independent (no serial x3 chain).
++//
++// Trit t of byte b is ((b * 3^t mod 256) * 3) >> 8 in {0,1,2}. In 16-bit lanes: v = (w * pow3[t]) & 0xFF,
++// then c = mulhi_epu16(v, 768) — (v*768)>>16 == (v*3)>>8 exactly for v <= 255. The generic kernel emits
++// codes planar per chunk: 16-byte chunk -> [0,80) as five rows of 16, 8-byte chunk -> [80,120) as five rows
++// of 8, qh -> [120,128). packus(c_a, c_b) + permute4x64(0xD8) turns two 16-lane rows into one 32-byte row
++// in exactly that order, so each q8 sub-block's codes come out already in the order its activations expect.
++void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    const int qk = QK_PTQ1_0;
++    const int nb = n / qk;
++
++    assert(n % qk == 0);
++    assert(nrc == 1);
++    UNUSED(nrc);
++    UNUSED(bx);
++    UNUSED(by);
++    UNUSED(bs);
++
++    const block_ptq1_0 * GGML_RESTRICT x = vx;
++    const block_q8_0   * GGML_RESTRICT y = vy;
++
++    float sumf = 0.0f;
++
++#if defined(__AVX2__)
++    const __m256i ones_8  = _mm256_set1_epi8(1);
++    const __m256i mask_ff = _mm256_set1_epi16(0xFF);
++    const __m256i m768    = _mm256_set1_epi16(768);
++    const __m256i p3_1 = _mm256_set1_epi16(3), p3_2 = _mm256_set1_epi16(9), p3_3 = _mm256_set1_epi16(27), p3_4 = _mm256_set1_epi16(81);
++#if !defined(GGML_DPBUSD_256)
++    const __m256i ones_16 = _mm256_set1_epi16(1);
++#endif
++    __m256 acc = _mm256_setzero_ps();
++
++    for (int i = 0; i < nb; i++) {
++        // chunk A: 16 bytes -> five 16-lane rows of codes (trit 0..4)
++        const __m256i wa = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *) &x[i].qs[0]));
++        const __m256i a0 = _mm256_mulhi_epu16(_mm256_and_si256(wa, mask_ff), m768);
++        const __m256i a1 = _mm256_mulhi_epu16(_mm256_and_si256(_mm256_mullo_epi16(wa, p3_1), mask_ff), m768);
++        const __m256i a2 = _mm256_mulhi_epu16(_mm256_and_si256(_mm256_mullo_epi16(wa, p3_2), mask_ff), m768);
++        const __m256i a3 = _mm256_mulhi_epu16(_mm256_and_si256(_mm256_mullo_epi16(wa, p3_3), mask_ff), m768);
++        const __m256i a4 = _mm256_mulhi_epu16(_mm256_and_si256(_mm256_mullo_epi16(wa, p3_4), mask_ff), m768);
++        // chunk B: 8 bytes in lanes 0..7 (lanes 8..15 zero) -> five rows, low 8 lanes meaningful
++        const __m256i wb = _mm256_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *) &x[i].qs[16]));
++        const __m256i b0 = _mm256_mulhi_epu16(_mm256_and_si256(wb, mask_ff), m768);
++        const __m256i b1 = _mm256_mulhi_epu16(_mm256_and_si256(_mm256_mullo_epi16(wb, p3_1), mask_ff), m768);
++        const __m256i b2 = _mm256_mulhi_epu16(_mm256_and_si256(_mm256_mullo_epi16(wb, p3_2), mask_ff), m768);
++        const __m256i b3 = _mm256_mulhi_epu16(_mm256_and_si256(_mm256_mullo_epi16(wb, p3_3), mask_ff), m768);
++        const __m256i b4 = _mm256_mulhi_epu16(_mm256_and_si256(_mm256_mullo_epi16(wb, p3_4), mask_ff), m768);
++        // qh: 2 bytes x 4 trits -> 8 codes ordered [t0h0 t0h1 t1h0 t1h1 ...], built in a register
++        uint64_t q64 = 0;
++        {
++            uint8_t h0 = x[i].qh[0], h1 = x[i].qh[1];
++            for (int t = 0; t < 4; ++t) {
++                q64 |= (uint64_t) (((uint16_t) h0 * 3) >> 8) << (16 * t);
++                q64 |= (uint64_t) (((uint16_t) h1 * 3) >> 8) << (16 * t + 8);
++                h0 = (uint8_t) (h0 * 3); h1 = (uint8_t) (h1 * 3);
++            }
++        }
++        const __m256i qh16 = _mm256_cvtepu8_epi16(_mm_cvtsi64_si128((long long) q64));
++
++        // assemble the four 32-code sub-blocks in generic emission order
++        const __m256i c0 = _mm256_permute4x64_epi64(_mm256_packus_epi16(a0, a1), 0xD8);                       // [a0 a1]
++        const __m256i c1 = _mm256_permute4x64_epi64(_mm256_packus_epi16(a2, a3), 0xD8);                       // [a2 a3]
++        const __m256i c2 = _mm256_permute4x64_epi64(_mm256_packus_epi16(a4, _mm256_permute2x128_si256(b0, b1, 0x20)), 0xD8); // [a4 b0 b1]
++        const __m256i c3 = _mm256_permute4x64_epi64(_mm256_packus_epi16(_mm256_permute2x128_si256(b2, b3, 0x20),
++                                                                         _mm256_permute2x128_si256(b4, qh16, 0x20)), 0xD8); // [b2 b3 b4 qh]
++        const __m256i codes[4] = { c0, c1, c2, c3 };
++
++        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
++        __m256 acc_block = _mm256_setzero_ps();
++        for (int k = 0; k < 4; k++) {
++            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
++            const __m256i qy = _mm256_loadu_si256((const __m256i *) yb->qs);
++#if defined(GGML_DPBUSD_256)
++            const __m256i s32 = _mm256_sub_epi32(GGML_DPBUSD_256(_mm256_setzero_si256(), codes[k], qy),
++                                                 GGML_DPBUSD_256(_mm256_setzero_si256(), ones_8,  qy));
++#else
++            const __m256i s32 = _mm256_sub_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(codes[k], qy), ones_16),
++                                                 _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8,  qy), ones_16));
++#endif
++            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d)), _mm256_cvtepi32_ps(s32), acc_block);
++        }
++        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
++    }
++    sumf = hsum_float_8(acc);
++#else
++    ggml_vec_dot_ptq1_0_q8_0_generic(n, &sumf, bs, vx, bx, vy, by, nrc);
++#endif
++
++    *s = sumf;
++}
++
++// PQ2_0 x Q8_K AVX2 / AVX-VNNI dot (tier 2, 2026-09-18). With one activation scale per 256 the four sub-block
++// dots of a 128-weight block are accumulated in int32 and scaled ONCE (4 dpbusd + 1 sub + 1 cvt + 1 fmadd per
++// 128 weights, against 4x(2 dpbusd + sub + cvt + fmadd) on the Q8_0 path). The sum(y) correction for the
++// unsigned codes is kept per lane (dpbusd(ones, y)) so the per-lane partials stay exact; the tiled GEMM in
++// llamafile/sgemm.cpp uses the same per-block float op and the same reduction, so both paths agree bit-for-bit.
++static inline __m256i pq2k_dpbusd_acc(__m256i acc, __m256i u, __m256i s) {
++#if defined(GGML_DPBUSD_256)
++    return GGML_DPBUSD_256(acc, u, s);
++#else
++    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
++#endif
++}
++void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QK_K == 0);
++    assert(nrc == 1);
++    UNUSED(nrc);
++    UNUSED(bx);
++    UNUSED(by);
++    UNUSED(bs);
++
++    const block_pq2_0 * GGML_RESTRICT x = vx;
++    const block_q8_K  * GGML_RESTRICT y = vy;
++    const int nb = n / QK_PQ2_0;
++
++    float sumf = 0.0f;
++#if defined(__AVX2__)
++    const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
++    const __m256i mask3   = _mm256_set1_epi8(3);
++    const __m256i ones_8  = _mm256_set1_epi8(1);
++    const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15,
++                                             0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
++    const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
++    __m256 acc = _mm256_setzero_ps();
++    for (int i = 0; i < nb; i++) {
++        const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
++        const int8_t * GGML_RESTRICT q8 = yb->qs + 128 * (i & 1);
++        __m256i acc_c = _mm256_setzero_si256();
++        __m256i acc_1 = _mm256_setzero_si256();
++        for (int k = 0; k < 4; k++) {
++            const __m256i qy  = _mm256_loadu_si256((const __m256i *) (q8 + 32 * k));
++            const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
++            int64_t xq; memcpy(&xq, &x[i].qs[8 * k], sizeof(xq));
++            const __m256i codes = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
++            acc_c = pq2k_dpbusd_acc(acc_c, codes,  qyp);
++            acc_1 = pq2k_dpbusd_acc(acc_1, ones_8, qyp);
++        }
++        const __m256i s32 = _mm256_sub_epi32(acc_c, acc_1);
++        acc = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[i].d) * yb->d), _mm256_cvtepi32_ps(s32), acc);
++    }
++    sumf = hsum_float_8(acc);
++#else
++    ggml_vec_dot_pq2_0_q8_K_generic(n, &sumf, bs, vx, bx, vy, by, nrc);
++#endif
++    *s = sumf;
++}
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 9cd2c2d..af49db0 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -239,8 +239,8 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+     },
+     [GGML_TYPE_PQ2_0] = {
+         .from_float               = quantize_row_pq2_0,
+-        .vec_dot                  = ggml_vec_dot_pq2_0_q8_0,
+-        .vec_dot_type             = GGML_TYPE_Q8_0,
++        .vec_dot                  = ggml_vec_dot_pq2_0_q8_K,
++        .vec_dot_type             = GGML_TYPE_Q8_K,
+         .nrows                    = 1,
+     },
+     [GGML_TYPE_PTQ1_0] = {
+@@ -3011,7 +3011,9 @@ struct ggml_cplan ggml_graph_plan(
+                     {
+                         const int64_t S_v = node->src[2]->ne[0];
+                         const int64_t K   = ggml_get_op_params_i32(node, 0);
+-                        const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
++                        // cache-write mode (op_params[2]) computes on the cache row: no state scratch
++                        const bool cache_write = ggml_get_op_params_i32(node, 2) != 0;
++                        const int64_t per_thread = S_v + ((K > 1 && !cache_write) ? S_v * S_v : 0);
+                         cur = per_thread * sizeof(float) * n_tasks;
+                     } break;
+                 case GGML_OP_COUNT:
+diff --git a/ggml/src/ggml-cpu/llamafile/sgemm.cpp b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+index 99b7d5a..db7a26e 100644
+--- a/ggml/src/ggml-cpu/llamafile/sgemm.cpp
++++ b/ggml/src/ggml-cpu/llamafile/sgemm.cpp
+@@ -56,6 +56,8 @@
+ 
+ #include <array>
+ #include <type_traits>
++#include <cstdlib>
++#include <cstring>
+ 
+ #ifdef _MSC_VER
+ #define NOINLINE __declspec(noinline)
+@@ -3772,6 +3774,265 @@ class tinyBLAS_PPC {
+ #endif
+ } // namespace
+ 
++// ---- PQ2_0 x Q8_K tiled GEMM (tier 2, 2026-09-18). Same tiling as tinyBLAS_PQ2_AVX; with a single activation
++// scale per 256 the per-(row,col) work per 128 weights collapses to 4 dpbusd + sub + cvt + fmadd, the activation
++// permute and sum(y) are shared across RM rows, the unpacked codes across RN columns. Per-block float op and the
++// final reduction match ggml_vec_dot_pq2_0_q8_K exactly, so the batched and single-token paths agree bit-for-bit.
++#if defined(__AVX2__)
++static inline float pq2_hsum(__m256 x);   // defined with the tier-1 class below
++static inline __m256i pq2k_sg_dpbusd(__m256i acc, __m256i u, __m256i s) {
++#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
++    return _mm256_dpbusd_epi32(acc, u, s);
++#elif defined(__AVXVNNI__)
++    return _mm256_dpbusd_avx_epi32(acc, u, s);
++#else
++    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
++#endif
++}
++#include <vector>
++class tinyBLAS_PQ2K_AVX {
++  public:
++    tinyBLAS_PQ2K_AVX(int64_t k, const block_pq2_0 *A, int64_t lda, const block_q8_K *B, int64_t ldb, float *C, int64_t ldc, int ith, int nth,
++                      const struct ggml_compute_params *params = nullptr)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth), params(params) {}
++    void matmul(int64_t m, int64_t n) { prep(n); mnpack(0, m, 0, n); }
++  private:
++    // Staging (2026-09-19): the permute of every 32-byte Q8_K group into code order and the lane-wise sum(y) of
++    // every 128-weight block depend only on (column, block), but the first tile recomputed both inside every row
++    // tile (m/RM times per matmul; perf: 91% of a 64-token batch was this kernel, ~1/3 of it that redundancy).
++    // Each thread now stages all n columns once per call into a thread-local buffer: per (column, PQ2 block)
++    // 4 x 32 permuted bytes followed by the 8 x int32 lane sums. Same integer sums in the same lanes, so the
++    // float accumulation order is unchanged and results stay bit-identical to ggml_vec_dot_pq2_0_q8_K.
++    static constexpr int64_t BP_BLOCK = 160;
++    const uint8_t *Bp = nullptr;
++    void prep(int64_t n) {
++        static thread_local std::vector<uint8_t> buf;
++        const size_t need = (size_t) n * (size_t) k * BP_BLOCK + 64;
++        if (buf.size() < need) buf.resize(need);
++        uint8_t *base = (uint8_t *) (((uintptr_t) buf.data() + 31) & ~(uintptr_t) 31);
++        const __m256i ones_8  = _mm256_set1_epi8(1);
++        const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15, 0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
++        const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
++        for (int64_t j = 0; j < n; ++j) {
++            for (int64_t l = 0; l < k; ++l) {
++                const int8_t *q8 = B[ldb * j + (l >> 1)].qs + 128 * (int) (l & 1);
++                uint8_t *dst = base + ((size_t) j * (size_t) k + (size_t) l) * BP_BLOCK;
++                __m256i sumq = _mm256_setzero_si256();
++                for (int s = 0; s < 4; ++s) {
++                    const __m256i qy  = _mm256_loadu_si256((const __m256i *) (q8 + 32 * s));
++                    const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
++                    _mm256_store_si256((__m256i *) (dst + 32 * s), qyp);
++                    sumq = pq2k_sg_dpbusd(sumq, ones_8, qyp);
++                }
++                _mm256_store_si256((__m256i *) (dst + 128), sumq);
++            }
++        }
++        Bp = base;
++    }
++    void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t mc, nc, mp, np;
++        // (RM=1,RN=8 measured L2-bound: 128 B of staged activations per (row,col) block vs 64 B for RM=2 — N=64
++        // went 88 -> 103 ms/token. Wide-and-two-rows stays the tile for every n.)
++        // Wide tiles first: 3-4 token columns share one weight pass (RM=2 keeps it at 15 ymm). n=2 keeps RM=4.
++        switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 4)) {
++        case 0x44: case 0x34: case 0x24: mc = 2; nc = 4; gemm<2, 4>(m0, m, n0, n); break;
++        case 0x43: case 0x33: case 0x23: mc = 2; nc = 3; gemm<2, 3>(m0, m, n0, n); break;
++        case 0x14: mc = 1; nc = 4; gemm<1, 4>(m0, m, n0, n); break;
++        case 0x13: mc = 1; nc = 3; gemm<1, 3>(m0, m, n0, n); break;
++        case 0x42: mc = 4; nc = 2; gemm<4, 2>(m0, m, n0, n); break;
++        case 0x41: mc = 4; nc = 1; gemm<4, 1>(m0, m, n0, n); break;
++        case 0x32: mc = 3; nc = 2; gemm<3, 2>(m0, m, n0, n); break;
++        case 0x31: mc = 3; nc = 1; gemm<3, 1>(m0, m, n0, n); break;
++        case 0x22: mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
++        case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
++        case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
++        case 0x11: mc = 1; nc = 1; gemm<1, 1>(m0, m, n0, n); break;
++        default: return;
++        }
++        mp = m0 + (m - m0) / mc * mc;
++        np = n0 + (n - n0) / nc * nc;
++        mnpack(mp, m, n0, np);
++        mnpack(m0, m, np, n);
++    }
++    template <int RM, int RN>
++    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        const int64_t ytiles = (m - m0) / RM;
++        const int64_t xtiles = (n - n0) / RN;
++        // A job is one row tile with ALL its column tiles, so every weight row streams from DRAM exactly once
++        // whichever thread takes it. With several threads and enough work the row tiles are claimed from the
++        // threadpool's shared counter (same pattern as the fp32 path above): this loop is compute-bound for
++        // n >= 4 and P-/E-cores run it at different speeds, so a static split left the P-cores idle at the end
++        // (-t 10 static: 101 ms/token vs 70 with -t 6).
++        const bool dynamic = nth > 1 && params != nullptr && xtiles * ytiles >= 64;
++        int64_t start, end;
++        if (dynamic) {
++            if (ith == 0) ggml_threadpool_chunk_set(params->threadpool, nth);
++            ggml_barrier(params->threadpool);
++            start = ith; end = ytiles;
++        } else {
++            const int64_t duty = (ytiles + nth - 1) / nth;
++            start = duty * ith; end = start + duty; if (end > ytiles) end = ytiles;
++        }
++        const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
++        const __m256i mask3   = _mm256_set1_epi8(3);
++        // Claims come in runs of CH row tiles to keep the shared counter off the hot path (ytiles is 2.5k-8.7k here).
++        constexpr int64_t CH = 8;
++        if (dynamic) { start = (int64_t) ith * CH; }
++        for (int64_t y0 = start; y0 < end; y0 = dynamic ? ggml_threadpool_chunk_add(params->threadpool, 1) * CH : end) {
++          const int64_t y1 = dynamic ? MIN(y0 + CH, end) : end;
++          for (int64_t yt = y0; yt < y1; ++yt) {
++            const int64_t ii = m0 + yt * RM;
++            for (int64_t xt = 0; xt < xtiles; ++xt) {
++            const int64_t jj = n0 + xt * RN;
++            const uint8_t *bp[RN];
++            for (int j = 0; j < RN; ++j) bp[j] = Bp + (size_t) (jj + j) * (size_t) k * BP_BLOCK;
++            __m256 Cv[RN][RM] = {};
++            for (int64_t l = 0; l < k; ++l) {           // k = number of PQ2_0 blocks per row
++                const int64_t lk = l >> 1;              // Q8_K block index
++                const size_t  lo = (size_t) l * BP_BLOCK;
++                __m256i acc[RN][RM];
++                for (int j = 0; j < RN; ++j) for (int i = 0; i < RM; ++i) acc[j][i] = _mm256_setzero_si256();
++                for (int s = 0; s < 4; ++s) {
++                    __m256i codes[RM];
++                    for (int i = 0; i < RM; ++i) {
++                        int64_t xq; memcpy(&xq, &A[lda * (ii + i) + l].qs[s * 8], sizeof(xq));
++                        codes[i] = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
++                    }
++                    for (int j = 0; j < RN; ++j) {
++                        const __m256i qyp = _mm256_load_si256((const __m256i *) (bp[j] + lo + 32 * s));
++                        for (int i = 0; i < RM; ++i) acc[j][i] = pq2k_sg_dpbusd(acc[j][i], codes[i], qyp);
++                    }
++                }
++                for (int i = 0; i < RM; ++i) {
++                    const float da = unhalf(A[lda * (ii + i) + l].d);
++                    for (int j = 0; j < RN; ++j) {
++                        const __m256i sumq = _mm256_load_si256((const __m256i *) (bp[j] + lo + 128));
++                        const __m256 sc = _mm256_set1_ps(da * B[ldb * (jj + j) + lk].d);
++                        Cv[j][i] = _mm256_fmadd_ps(sc, _mm256_cvtepi32_ps(_mm256_sub_epi32(acc[j][i], sumq)), Cv[j][i]);
++                    }
++                }
++            }
++            for (int j = 0; j < RN; ++j)
++                for (int i = 0; i < RM; ++i)
++                    C[ldc * (jj + j) + (ii + i)] = pq2_hsum(Cv[j][i]);
++            }
++          }
++        }
++        if (dynamic) ggml_barrier(params->threadpool);
++    }
++    const block_pq2_0 *const A;
++    const block_q8_K  *const B;
++    float *const C;
++    const int64_t k, lda, ldb, ldc;
++    const int ith, nth;
++    const struct ggml_compute_params *const params;
++};
++#endif // __AVX2__
++
++// ---- PQ2_0 (PrismML 2-bit ternary, group 128) x Q8_0 tiled GEMM for AVX2 / AVX-VNNI. Added 2026-09-18. ----
++// The vec_dot path re-unpacks every 128-weight block once PER TOKEN, so for a batch of n tokens (speculative
++// verify, prompt eval) unpack dominates: measured batch cost was a flat 168 ms/token regardless of n. This tile
++// unpacks a block once per row and reuses it across RN token columns, and computes the activation permute and
++// the sum(y) term once per column and reuses them across RM rows. Per (row, col) the float accumulation order
++// and the horizontal reduction are the SAME as ggml_vec_dot_pq2_0_q8_0, so results are bit-identical to the
++// vec_dot path. PQ2_SGEMM=0 in the environment disables this case (A/B and exactness checks).
++#if defined(__AVX2__)
++static inline __m256i pq2_dpbusd(__m256i u, __m256i s) {
++#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
++    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), u, s);
++#elif defined(__AVXVNNI__)
++    return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), u, s);
++#else
++    return _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1));
++#endif
++}
++static inline float pq2_hsum(__m256 x) { // identical reduction order to hsum_float_8 in arch/x86/quants.c
++    __m128 res = _mm256_extractf128_ps(x, 1);
++    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
++    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
++    res = _mm_add_ss(res, _mm_movehdup_ps(res));
++    return _mm_cvtss_f32(res);
++}
++class tinyBLAS_PQ2_AVX {
++  public:
++    tinyBLAS_PQ2_AVX(int64_t k, const block_pq2_0 *A, int64_t lda, const block_q8_0 *B, int64_t ldb, float *C, int64_t ldc, int ith, int nth)
++        : A(A), B(B), C(C), k(k), lda(lda), ldb(ldb), ldc(ldc), ith(ith), nth(nth) {}
++    void matmul(int64_t m, int64_t n) { mnpack(0, m, 0, n); }
++  private:
++    void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        int64_t mc, nc, mp, np;
++        switch ((MIN(m - m0, 4) << 4) | MIN(n - n0, 2)) {
++        case 0x42: mc = 4; nc = 2; gemm<4, 2>(m0, m, n0, n); break;
++        case 0x41: mc = 4; nc = 1; gemm<4, 1>(m0, m, n0, n); break;
++        case 0x32: mc = 3; nc = 2; gemm<3, 2>(m0, m, n0, n); break;
++        case 0x31: mc = 3; nc = 1; gemm<3, 1>(m0, m, n0, n); break;
++        case 0x22: mc = 2; nc = 2; gemm<2, 2>(m0, m, n0, n); break;
++        case 0x21: mc = 2; nc = 1; gemm<2, 1>(m0, m, n0, n); break;
++        case 0x12: mc = 1; nc = 2; gemm<1, 2>(m0, m, n0, n); break;
++        case 0x11: mc = 1; nc = 1; gemm<1, 1>(m0, m, n0, n); break;
++        default: return;
++        }
++        mp = m0 + (m - m0) / mc * mc;
++        np = n0 + (n - n0) / nc * nc;
++        mnpack(mp, m, n0, np);
++        mnpack(m0, m, np, n);
++    }
++    template <int RM, int RN>
++    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
++        const int64_t ytiles = (m - m0) / RM;
++        const int64_t xtiles = (n - n0) / RN;
++        const int64_t tiles = xtiles * ytiles;
++        const int64_t duty = (tiles + nth - 1) / nth;
++        const int64_t start = duty * ith;
++        int64_t end = start + duty;
++        if (end > tiles) end = tiles;
++        const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
++        const __m256i mask3   = _mm256_set1_epi8(3);
++        const __m256i ones_8  = _mm256_set1_epi8(1);
++        const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15, 0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
++        const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
++        for (int64_t job = start; job < end; ++job) {
++            const int64_t ii = m0 + job / xtiles * RM;
++            const int64_t jj = n0 + job % xtiles * RN;
++            __m256 Cv[RN][RM] = {};
++            for (int64_t l = 0; l < k; ++l) {
++                __m256 blk[RN][RM] = {};
++                for (int s = 0; s < 4; ++s) {
++                    __m256i codes[RM];
++                    for (int i = 0; i < RM; ++i) {
++                        int64_t xq; memcpy(&xq, &A[lda * (ii + i) + l].qs[s * 8], sizeof(xq));
++                        codes[i] = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
++                    }
++                    for (int j = 0; j < RN; ++j) {
++                        const block_q8_0 *yb = &B[ldb * (jj + j) + 4 * l + s];
++                        const __m256i qy  = _mm256_loadu_si256((const __m256i *) yb->qs);
++                        const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
++                        const __m256i sy  = pq2_dpbusd(ones_8, qyp);
++                        const __m256  db  = _mm256_set1_ps(unhalf(yb->d));
++                        for (int i = 0; i < RM; ++i) {
++                            const __m256i s32 = _mm256_sub_epi32(pq2_dpbusd(codes[i], qyp), sy);
++                            blk[j][i] = _mm256_fmadd_ps(db, _mm256_cvtepi32_ps(s32), blk[j][i]);
++                        }
++                    }
++                }
++                for (int i = 0; i < RM; ++i) {
++                    const __m256 da = _mm256_set1_ps(unhalf(A[lda * (ii + i) + l].d));
++                    for (int j = 0; j < RN; ++j) Cv[j][i] = _mm256_fmadd_ps(da, blk[j][i], Cv[j][i]);
++                }
++            }
++            for (int j = 0; j < RN; ++j)
++                for (int i = 0; i < RM; ++i)
++                    C[ldc * (jj + j) + (ii + i)] = pq2_hsum(Cv[j][i]);
++        }
++    }
++    const block_pq2_0 *const A;
++    const block_q8_0  *const B;
++    float *const C;
++    const int64_t k, lda, ldb, ldc;
++    const int ith, nth;
++};
++#endif // __AVX2__
++
+ /**
+  * Performs optimized matrix multiplication on CPU.
+  *
+@@ -4038,6 +4299,24 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
+         return false;
+     }
+ 
++    case GGML_TYPE_PQ2_0: {
++#if defined(__AVX2__)
++        { static int off = -1; if (off < 0) { const char * e = getenv("PQ2_SGEMM"); off = (e && e[0] == '0') ? 1 : 0; } if (off) return false; }
++        if (Btype == GGML_TYPE_Q8_K) {
++            tinyBLAS_PQ2K_AVX tb{ k, (const block_pq2_0 *)A, lda, (const block_q8_K *)B, ldb, (float *)C, ldc, params->ith, params->nth, params };
++            tb.matmul(m, n);
++            return true;
++        }
++        if (Btype == GGML_TYPE_Q8_0) {
++            tinyBLAS_PQ2_AVX tb{ k, (const block_pq2_0 *)A, lda, (const block_q8_0 *)B, ldb, (float *)C, ldc, params->ith, params->nth };
++            tb.matmul(m, n);
++            return true;
++        }
++        return false;
++#else
++        return false;
++#endif
++    }
+     case GGML_TYPE_Q8_0: {
+         if (Btype != GGML_TYPE_Q8_0)
+            return false;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 4fc7514..83a616e 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -10819,11 +10819,26 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+     const int64_t state_seq_stride = src_rows ? 0 : (int64_t) (src_state->nb[3] / sizeof(float));
+     const int64_t state_row_size   = src_rows ? (int64_t) (src_state->nb[1] / sizeof(float)) : 0;
+ 
+-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
++    // cache-write mode (op_params[2], ggml_gated_delta_net_cache): the live state is
++    // updated in place in cache row rows_out[seq] and snapshot slots 1..K-1 are
++    // written straight into cache rows rows_out[slot*n_seqs + seq]; the result holds
++    // the attention scores only (state_out_base is unused in this mode).
++    const bool      cache_write = ggml_get_op_params_i32(dst, 2) != 0;
++    GGML_ASSERT(!cache_write || state_rows_idx != nullptr);
++    const int64_t * rows_out = cache_write ? (const int64_t *) dst->src[9]->data : nullptr;
++    float *         cache    = cache_write ? (float *) src_state->data : nullptr;
++    const int64_t   mem_size = cache_write ? ggml_get_op_params_i32(dst, 3) : 1;
++
++    // the legacy K > 1 path stages the state through a per-thread scratch; the
++    // cache-write path never does (it computes on the cache row itself).
++    // ggml-cpu.c (graph plan work size) mirrors this expression.
++    const bool use_state_work = K > 1 && !cache_write;
++
++    const int64_t per_thread = S_v + (use_state_work ? S_v * S_v : 0);
+     const int ith = params->ith;
+ 
+     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
+-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
++    float * state_work  = use_state_work ? (delta + S_v) : nullptr;
+ 
+     // output layout: [attn_scores | new_states]
+     // attn_scores: S_v * H * n_tokens * n_seqs    floats
+@@ -10855,19 +10870,34 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+         const int64_t iq3 = iv3 / rq3;
+         const int64_t ik3 = iv3 / rk3;
+ 
+-        // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
+-        // For K>1, work in scratch and copy out per-token when the slot is in range.
+-        float * s_out = (K > 1)
+-            ? state_work
+-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+-
+-        // copy input state into the working buffer and operate in-place.
+-        // scratch mode: state layout [S_v, S_v, H, n_seqs], seq iv3 starts at
+-        // iv3 * state_seq_stride. rows mode: cache row state_rows_idx[iv3].
++        // input state: scratch mode: state layout [S_v, S_v, H, n_seqs], seq iv3
++        // starts at iv3 * state_seq_stride. rows mode: cache row state_rows_idx[iv3].
+         const float * s_in = state_rows_idx
+             ? state_in_base + (int64_t) state_rows_idx[iv3] * state_row_size + iv1 * S_v * S_v
+             : state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+-        memcpy(s_out, s_in, S_v * S_v * sizeof(float));
++
++        float * s_out;
++        if (cache_write) {
++            // operate directly on the live cache row rows_out[iv3]. rows_in[iv3] is
++            // either that same row (steady state: no copy at all) or another plane
++            // of the same cell (pending rollback / freshly zeroed cell): copy it in
++            // first -- distinct rows, so plain memcpy is safe.
++            const int64_t row_out = rows_out[iv3];
++            GGML_ASSERT(row_out % mem_size == (int64_t) state_rows_idx[iv3] % mem_size);
++            s_out = cache + row_out * state_row_size + iv1 * S_v * S_v;
++            if (s_out != s_in) {
++                memcpy(s_out, s_in, S_v * S_v * sizeof(float));
++            }
++        } else {
++            // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
++            // For K>1, work in scratch and copy out per-token when the slot is in range.
++            s_out = (K > 1)
++                ? state_work
++                : state_out_base + (iv3 * H + iv1) * S_v * S_v;
++
++            // copy input state into the working buffer and operate in-place.
++            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
++        }
+ 
+         // attn output pointer for first token of this (head, seq)
+         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+@@ -10924,7 +10954,20 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
+ 
+             attn_data += S_v * H; // advance to next token
+ 
+-            if (K > 1) {
++            if (cache_write) {
++                // snapshot slot s (state s tokens back) -> cache row rows_out[s*n_seqs + seq].
++                // slot 0 is s_out itself (already in place). slot <= n_tokens-1 and
++                // slot < K keep the index below min(n_tokens, K)*n_seqs. Within this
++                // unit the rollback source plane was fully copied into s_out before
++                // the token loop, so overwriting it here is read-before-write safe.
++                if (K > 1) {
++                    const int64_t slot = n_tokens - 1 - t;
++                    if (slot >= 1 && slot < K) {
++                        float * snap = cache + rows_out[slot * n_seqs + iv3] * state_row_size + iv1 * S_v * S_v;
++                        memcpy(snap, s_out, S_v * S_v * sizeof(float));
++                    }
++                }
++            } else if (K > 1) {
+                 const int64_t target_slot = n_tokens - 1 - t;
+                 if (target_slot >= 0 && target_slot < K) {
+                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 3e275dc..e8a3067 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -1461,3 +1461,36 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
+     assert(k % QK_K == 0);
+     quantize_iq4_xs(x, y, 1, k, NULL);
+ }
++
++// PQ2_0 x Q8_K reference dot (tier 2, 2026-09-18): one activation scale per 256 elements instead of per 32, so a
++// 128-weight block's integer dot can be accumulated in one int32 and scaled once. Scalar reference for the x86
++// kernel's tolerance test; also the non-x86 fallback. Two PQ2_0 blocks map onto one Q8_K block (halves).
++void ggml_vec_dot_pq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    assert(n % QK_K == 0);
++    assert(nrc == 1);
++    UNUSED(nrc);
++    UNUSED(bx);
++    UNUSED(by);
++    UNUSED(bs);
++
++    const block_pq2_0 * GGML_RESTRICT x = vx;
++    const block_q8_K  * GGML_RESTRICT y = vy;
++    const int nb = n / QK_PQ2_0;
++
++    float sumf = 0.0f;
++    for (int i = 0; i < nb; i++) {
++        const block_q8_K * GGML_RESTRICT yb = &y[i >> 1];
++        const int8_t * GGML_RESTRICT q8 = yb->qs + 128 * (i & 1);
++        int sumi = 0;
++        for (int k = 0; k < 4; k++) {
++            for (int b = 0; b < 8; b++) {
++                const uint8_t byte = x[i].qs[8 * k + b];
++                for (int j = 0; j < 4; j++) {
++                    sumi += (((byte >> (2 * j)) & 3) - 1) * q8[32 * k + 4 * b + j];
++                }
++            }
++        }
++        sumf += (GGML_CPU_FP16_TO_FP32(x[i].d) * yb->d) * (float) sumi;
++    }
++    *s = sumf;
++}
+diff --git a/ggml/src/ggml-cpu/quants.h b/ggml/src/ggml-cpu/quants.h
+index f00f35c..2981ec9 100644
+--- a/ggml/src/ggml-cpu/quants.h
++++ b/ggml/src/ggml-cpu/quants.h
+@@ -43,6 +43,7 @@ void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
+ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_pq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_ptq1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+@@ -78,6 +79,7 @@ void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
+ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+ void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_pq2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++void ggml_vec_dot_pq2_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_ptq1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index fa2a9c4..c233176 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6423,6 +6423,75 @@ struct ggml_tensor * ggml_gated_delta_net_rows(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_gated_delta_net_cache(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * g,
++        struct ggml_tensor  * beta,
++        struct ggml_tensor  * states,
++        struct ggml_tensor  * rows_in,
++        struct ggml_tensor  * rows_out,
++        int                   n_snap_slots,
++        int                   mem_size) {
++    GGML_ASSERT(ggml_is_contiguous_rows(q));
++    GGML_ASSERT(ggml_is_contiguous_rows(k));
++    GGML_ASSERT(ggml_is_contiguous_rows(v));
++    GGML_ASSERT(ggml_is_contiguous(g));
++    GGML_ASSERT(ggml_is_contiguous(beta));
++    GGML_ASSERT(ggml_is_contiguous(states));
++    GGML_ASSERT(ggml_is_contiguous(rows_in));
++    GGML_ASSERT(ggml_is_contiguous(rows_out));
++
++    GGML_ASSERT(q->type == GGML_TYPE_F32);
++    GGML_ASSERT(k->type == GGML_TYPE_F32);
++    GGML_ASSERT(v->type == GGML_TYPE_F32);
++    GGML_ASSERT(g->type == GGML_TYPE_F32);
++    GGML_ASSERT(beta->type == GGML_TYPE_F32);
++    GGML_ASSERT(states->type == GGML_TYPE_F32);
++    GGML_ASSERT(rows_in->type == GGML_TYPE_I32);
++    GGML_ASSERT(rows_out->type == GGML_TYPE_I64);
++
++    const int64_t S_v      = v->ne[0];
++    const int64_t H        = v->ne[1];
++    const int64_t n_tokens = v->ne[2];
++    const int64_t n_seqs   = v->ne[3];
++
++    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
++    GGML_ASSERT(beta->ne[0] == 1);
++
++    // states is a 2D cache view (D, n_rows); each row is one sequence's full state
++    GGML_ASSERT(states->ne[0] == S_v * S_v * H);
++    GGML_ASSERT(rows_in->ne[0] == n_seqs);
++
++    const int64_t K = n_snap_slots;
++    GGML_ASSERT(K >= 1);
++    GGML_ASSERT(mem_size >= 1);
++    GGML_ASSERT(rows_out->ne[0] == MIN(n_tokens, K) * n_seqs);
++
++    // the state stays in the cache: the result carries the attention scores only
++    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs, 1, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    ggml_set_op_params_i32(result, 0, (int32_t) K);
++    ggml_set_op_params_i32(result, 2, 1);        // cache-write flag (op_params[1] is the raw-gates bit)
++    ggml_set_op_params_i32(result, 3, mem_size); // kernel same-cell check: row % mem_size
++
++    result->op     = GGML_OP_GATED_DELTA_NET;
++    result->src[0] = q;
++    result->src[1] = k;
++    result->src[2] = v;
++    result->src[3] = g;
++    result->src[4] = beta;
++    result->src[5] = states;
++    result->src[6] = rows_in;
++    // src[7] and src[8] are reserved for ggml_gated_delta_net_set_raw_gates
++    result->src[9] = rows_out;
++
++    return result;
++}
++
+ void ggml_gated_delta_net_set_raw_gates(
+         struct ggml_tensor  * gdn,
+         struct ggml_tensor  * dt_bias,
+diff --git a/include/llama.h b/include/llama.h
+index deb1e12..20fd015 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -751,12 +751,30 @@ extern "C" {
+     // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
+     // p0 < 0     : [0,  p1]
+     // p1 < 0     : [p0, inf)
++    // Recurrent memory with rollback snapshots (n_rs_seq > 0): removing the tail [p0, inf) of a
++    // sequence is honoured as a rollback of n = pos_max - p0 + 1 positions only when
++    // 1 <= n <= min(T - 1, n_snap), where T is the token count of the sequence's last micro-batch
++    // and n_snap its snapshot budget (llama_memory_seq_rs_snapshots, default n_rs_seq): a micro-batch
++    // snapshots the state after each of its last min(T, n_rs_seq + 1) - 1 tokens and never the state
++    // it started from, so a rollback across earlier micro-batches (e.g. N single-token decodes, then
++    // N positions back) is refused rather than read from a stale plane. The rollback stays pending
++    // until the sequence's next decode consumes it; a second partial removal before that is refused
+     LLAMA_API bool llama_memory_seq_rm(
+             llama_memory_t mem,
+               llama_seq_id seq_id,
+                  llama_pos p0,
+                  llama_pos p1);
+ 
++    // Set the number of recurrent-state rollback snapshot planes (0..llama_n_rs_seq) that the memory
++    // may write for and roll back on the specified sequence. Default: llama_n_rs_seq (every plane).
++    // A sequence with budget 0 keeps a single state plane; partial removals of its tail (see
++    // llama_memory_seq_rm) are refused, exactly as with a context created with n_rs_seq = 0.
++    // Returns false if the memory has no recurrent state or the arguments are out of range
++    LLAMA_API bool llama_memory_seq_rs_snapshots(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++                  uint32_t n_snap);
++
+     // Copy all tokens that belong to the specified sequence to another sequence
+     // p0 < 0 : [0,  p1]
+     // p1 < 0 : [p0, inf)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cc8c004..a06fef3 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -4232,6 +4232,17 @@ bool llama_memory_seq_rm(
+     return mem->seq_rm(seq_id, p0, p1);
+ }
+ 
++bool llama_memory_seq_rs_snapshots(
++        llama_memory_t mem,
++          llama_seq_id seq_id,
++              uint32_t n_snap) {
++    if (!mem) {
++        return false;
++    }
++
++    return mem->seq_rs_snapshots(seq_id, n_snap);
++}
++
+ void llama_memory_seq_cp(
+         llama_memory_t mem,
+           llama_seq_id seq_id_src,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 99f263e..569d13c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -417,6 +417,15 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
+     res &= head == mctx_cur->get_head();
+     res &= rs_z == mctx_cur->get_rs_z();
+ 
++    // a graph built for the in-place GDN path must not be reused by a ubatch
++    // whose cells were reordered / freshly zeroed (and vice versa); the memory
++    // was already updated by apply() -> find_slot before can_reuse runs
++    res &= rs_inplace == mctx_cur->rs_inplace_ok(params.ubatch.n_seqs);
++
++    // the snapshot plane count K = rs_n_snap + 1 is baked into the op params
++    // (and the s_write_rows check above cannot see it at T = 1)
++    res &= rs_n_snap == mctx_cur->get_n_snap();
++
+     return res;
+ }
+ 
+@@ -3573,6 +3582,9 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+     inp->head = mctx_cur->get_head();
+     inp->rs_z = mctx_cur->get_rs_z();
+ 
++    inp->rs_inplace = mctx_cur->rs_inplace_ok(n_seqs);
++    inp->rs_n_snap  = mctx_cur->get_n_snap();
++
+     return inp;
+ }
+ 
+@@ -3601,28 +3613,38 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
+         llm_graph_input_rs * inp,
+         ggml_tensor * s,
+             int32_t   state_size,
+-            int32_t   n_seqs) const {
++            int32_t   n_seqs,
++               bool   inplace) const {
+     const auto * kv_state = inp->mctx;
+ 
+     const uint32_t n_rs     = kv_state->get_n_rs();
+     const uint32_t rs_head  = kv_state->get_head();
+     const  int32_t rs_zero  = kv_state->get_rs_z();
+ 
++    // the in-place consumer mutates the cache rows of the ubatch: it is only
++    // entered when every main row is the identity and the extra range below is
++    // empty (rs_inplace_ok), which makes the ordering hazard described next
++    // unreachable for it
++    GGML_ASSERT(!inplace || (inp->rs_inplace && n_rs == (uint32_t) n_seqs));
++
+     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+ 
+     // same cache hygiene as build_rs, minus the main gather (the consumer reads
+     // per-seq rows via inp->s_copy_main directly, inside the GDN op).
+     //
+-    // KNOWN LIMITATION (tracked follow-up): build_rs gathers the main rows
+-    // BEFORE this extra relocation, so an overlapping main row is read before
+-    // being overwritten. rows mode defers the main read into the consumer, and
+-    // s_copy() maps a main row to an arbitrary cache slot (idx*size + src0),
+-    // which can fall inside the extra destination [rs_head+n_seqs, rs_head+n_rs)
+-    // during a cache reorder -- so this relocation could clobber a main row the
+-    // consumer will later read. Not reachable on the current single-sequence
+-    // decode path, but it is a real multi-sequence hazard; the correct fix is
+-    // to order the relocation AFTER the GDN read (build_rs's read-before-write
+-    // ordering), which is a graph-dependency refactor left as follow-up.
++    // KNOWN LIMITATION of the Metal rows mode (tracked follow-up): build_rs
++    // gathers the main rows BEFORE this extra relocation, so an overlapping main
++    // row is read before being overwritten. rows mode defers the main read into
++    // the consumer, and s_copy() maps a main row to an arbitrary cache slot
++    // (idx*size + src0), which can fall inside the extra destination
++    // [rs_head+n_seqs, rs_head+n_rs) during a cache reorder -- so this relocation
++    // could clobber a main row the consumer will later read. The CPU in-place
++    // mode never enters this function with a non-empty extra range (see the
++    // assert above; transition ubatches take the gathered build_rs path), so the
++    // hazard only remains for the Metal rows + SET_ROWS mode on a cache reorder;
++    // the correct fix there is to order the relocation AFTER the GDN read
++    // (build_rs's read-before-write ordering), a graph-dependency refactor left
++    // as follow-up.
+     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+     ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index e85c1aa..d87d3c7 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -346,6 +346,16 @@ public:
+     ggml_tensor * s_write_rows = nullptr;
+     int64_t       s_write_K    = 0;
+ 
++    // every ubatch seq reads its own cell and n_rs == n_seqs: the GDN op may
++    // update the cache rows in place (rs_inplace_ok); part of the reuse key
++    bool rs_inplace = false;
++
++    // rollback snapshot planes of this graph's ubatch: the GDN paths write
++    // K = rs_n_snap + 1 state planes per seq (get_n_snap). Part of the reuse
++    // key: at T = 1 the s_write_rows length is the same for every K while the
++    // op params, the conv-state copies and the fused-gate choice differ
++    uint32_t rs_n_snap = 0;
++
+     const llama_memory_recurrent_context * mctx;
+ 
+     // used in view offsets, need to match for valid graph reuse
+@@ -1437,11 +1447,14 @@ struct llm_graph_context {
+     // (state_size, n_rows) cache view. For consumers that read per-seq state
+     // rows directly via inp->s_copy_main (e.g. ggml_gated_delta_net_rows),
+     // saving a get_rows per layer per decode.
++    // inplace: the consumer is the cache-writing op (ggml_gated_delta_net_cache);
++    // requires inp->rs_inplace, i.e. an empty extra range and identity main rows.
+     ggml_tensor * build_rs_cache_view(
+             llm_graph_input_rs * inp,
+             ggml_tensor * s,
+                 int32_t   state_size,
+-                int32_t   n_seqs) const;
++                int32_t   n_seqs,
++                   bool   inplace = false) const;
+ 
+     // I64 cache-row indices for the rows-mode snapshot scatter: row of
+     // (slot s, seq i) = s*mem_size + head + i, matching the strided-cpy
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 42c7381..099422d 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -149,6 +149,10 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+     return mem_attn->seq_rm(seq_id, p0, p1);
+ }
+ 
++bool llama_memory_hybrid::seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) {
++    return mem_recr->seq_rs_snapshots(seq_id, n_snap);
++}
++
+ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb..78fba3d 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -61,6 +61,7 @@ public:
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    bool seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index e299097..a9749a0 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -1,5 +1,6 @@
+ #include "llama-memory-recurrent.h"
+ 
++#include "ggml-alloc.h"
+ #include "ggml-backend.h"
+ #include "llama-impl.h"
+ #include "llama-io.h"
+@@ -8,15 +9,66 @@
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cerrno>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <map>
+ #include <stdexcept>
+ 
++#ifdef __linux__
++#include <sys/mman.h>
++#endif
++
+ //
+ // llama_memory_recurrent
+ //
+ 
++#ifdef __linux__
++// One anonymous, private mapping for every tensor of ctx, placed exactly as
++// ggml_backend_alloc_ctx_tensors_from_buft would place them (same padded sizes,
++// same alignment, same order) but wrapped with ggml_backend_cpu_buffer_from_ptr,
++// which does not own the memory: the caller munmaps it after the buffer is
++// freed. Returns nullptr (and touches nothing) when the mapping cannot be made.
++static ggml_backend_buffer_t rs_alloc_lazy_zero_host_buffer(
++        ggml_context * ctx, ggml_backend_buffer_type_t buft, void ** ptr_out, size_t * size_out) {
++    const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
++    if (size == 0) {
++        return nullptr;
++    }
++
++    void * ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (ptr == MAP_FAILED) {
++        LLAMA_LOG_WARN("%s: anonymous mmap of %zu bytes failed (%s), falling back to the eager clear\n",
++                __func__, size, strerror(errno));
++        return nullptr;
++    }
++
++    // mmap returns page-aligned memory, which satisfies the CPU buffer alignment
++    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(ptr, size);
++    if (!buf) {
++        munmap(ptr, size);
++        return nullptr;
++    }
++
++    ggml_tallocr talloc = ggml_tallocr_new(buf);
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++        if (t->data == nullptr && t->view_src == nullptr) {
++            if (ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
++                ggml_backend_buffer_free(buf);
++                munmap(ptr, size);
++                return nullptr;
++            }
++        }
++    }
++
++    *ptr_out  = ptr;
++    *size_out = size;
++
++    return buf;
++}
++#endif
++
+ llama_memory_recurrent::llama_memory_recurrent(
+         const llama_model & model,
+                 ggml_type   type_r,
+@@ -34,6 +86,8 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+     this->n_rs_seq = n_rs_seq;
+     rs_idx.assign(n_seq_max, 0);
++    rs_n_snap.assign(n_seq_max, n_rs_seq); // every seq keeps all planes unless the API lowers its budget
++    rs_n_valid.assign(n_seq_max, 0);
+ 
+     cells.clear();
+     cells.resize(mem_size);
+@@ -106,13 +160,62 @@ llama_memory_recurrent::llama_memory_recurrent(
+     }
+ 
+     // allocate tensors and initialize the buffers to avoid NaNs in the padding
++    //
++    // Host (CPU) buffers, Linux: by default the whole RS buffer is one anonymous
++    // private mmap (rs_alloc_lazy_zero_host_buffer) and is NOT memset. The
++    // kernel hands out zero pages on first touch, so the "no NaN padding"
++    // guarantee of the eager clear holds without making every cell of every
++    // snapshot plane resident at construction: the buffer is
++    // mem_size*(1+n_rs_seq) rows per layer, so --parallel 16 with n_rs_seq = 2
++    // pinned ~4.7 GiB of the 15 GiB here (evicting the mmap'd weights that
++    // decode streams on every token) while one active slot needs ~0.3 GiB.
++    // Residency now follows the cells that were actually written.
++    //
++    // Why skipping the memset is exact -- every row the graph ever reads is
++    // zero by construction or was written before it is read:
++    //  - a fresh sequence reads the rs_z row, which the graph zeroes in place
++    //    (ggml_scale_inplace by 0 in build_rs / build_rs_cache_view) before any
++    //    consumer reads it; 0 * (a kernel zero page) == 0 either way;
++    //  - every other main row is src0 = src of a used cell (find_slot), i.e. a
++    //    row written by an earlier step's write-back / in-place update, by the
++    //    extra-row relocation, or by state_read_data;
++    //  - a rollback read of snapshot plane r (1 <= r <= n_rs_seq) only happens
++    //    after a ubatch of that sequence wrote slot r of the same cell: seq_rm
++    //    only accepts rollback <= n_rs_seq, split_equal keeps the trailing
++    //    n_rs_seq + 1 tokens of a sequence in one ubatch and the op writes slots
++    //    0..min(T, K)-1, so the plane was written before it is read;
++    //  - the alignment padding between tensors is never read.
++    // clear(true) drops the pages with madvise(MADV_DONTNEED) instead of a
++    // memset (a private anonymous mapping then reads back as zero).
++    // LLAMA_RS_EAGER_ZERO=1 restores the eager alloc + memset path.
++#ifdef __linux__
++    static const bool rs_eager_zero = getenv("LLAMA_RS_EAGER_ZERO") != nullptr;
++#endif
++
+     for (auto & [buft, ctx] : ctx_map) {
+-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
++        ggml_backend_buffer_t buf  = nullptr;
++        bool                  lazy = false;
++
++#ifdef __linux__
++        if (!rs_eager_zero && buft == ggml_backend_cpu_buffer_type()) {
++            void * ptr  = nullptr;
++            size_t size = 0;
++            buf = rs_alloc_lazy_zero_host_buffer(ctx.get(), buft, &ptr, &size);
++            if (buf) {
++                mmaps.push_back({ buf, ptr, size });
++                lazy = true;
++            }
++        }
++#endif
+         if (!buf) {
+-            throw std::runtime_error("failed to allocate buffer for rs cache");
++            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
++            if (!buf) {
++                throw std::runtime_error("failed to allocate buffer for rs cache");
++            }
++            ggml_backend_buffer_clear(buf, 0);
+         }
+-        ggml_backend_buffer_clear(buf, 0);
+-        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
++        LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB%s\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0,
++                lazy ? " (anonymous mmap, lazily zeroed)" : "");
+         ctxs_bufs.emplace_back(std::move(ctx), buf);
+     }
+ 
+@@ -127,6 +230,17 @@ llama_memory_recurrent::llama_memory_recurrent(
+     }
+ }
+ 
++llama_memory_recurrent::~llama_memory_recurrent() {
++    // the from_ptr buffers do not own their memory: free them first, then unmap
++    ctxs_bufs.clear();
++#ifdef __linux__
++    for (const auto & m : mmaps) {
++        munmap(m.ptr, m.size);
++    }
++#endif
++    mmaps.clear();
++}
++
+ void llama_memory_recurrent::clear(bool data) {
+     for (int32_t i = 0; i < (int32_t) size; ++i) {
+         cells[i].pos = -1;
+@@ -140,11 +254,25 @@ void llama_memory_recurrent::clear(bool data) {
+ 
+     if (data) {
+         for (auto & [_, buf] : ctxs_bufs) {
+-            ggml_backend_buffer_clear(buf.get(), 0);
++            bool dropped = false;
++#ifdef __linux__
++            for (const auto & m : mmaps) {
++                if (m.buf == buf.get()) {
++                    // drop the pages instead of memset: a private anonymous
++                    // mapping reads back as zero and stays non-resident
++                    dropped = madvise(m.ptr, m.size, MADV_DONTNEED) == 0;
++                    break;
++                }
++            }
++#endif
++            if (!dropped) {
++                ggml_backend_buffer_clear(buf.get(), 0);
++            }
+         }
+     }
+ 
+     std::fill(rs_idx.begin(), rs_idx.end(), 0);
++    std::fill(rs_n_valid.begin(), rs_n_valid.end(), 0);
+ }
+ 
+ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+@@ -166,6 +294,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
+     if (rm_all) {
+         set_rs_idx(seq_id, 0);
++        set_rs_n_valid(seq_id, 0);
+     }
+ 
+     // models like Mamba or RWKV can't have a state partially erased at the end
+@@ -179,12 +308,16 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+         if (tail_id >= 0) {
+             auto & cell = cells[tail_id];
+ 
+-            // partial rollback via per-token snapshot index (bounded by n_rs_seq)
++            // partial rollback via per-token snapshot index, bounded by the seq's snapshot budget
++            // (rs_n_snap[seq_id] <= n_rs_seq; a budget of 0 refuses like a memory with n_rs_seq == 0)
++            // and by the planes its last ubatch actually wrote (rs_n_valid: beyond it a plane holds
++            // the state of an older ubatch, so reading it would not be a rollback)
+             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
+                 const llama_pos rollback = cell.pos - (p0 - 1);
+                 // pending rollback is single-use
+                 const bool pending = rs_idx[seq_id] != 0;
+-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
++                if (!pending && rollback >= 1 &&
++                        rollback <= (llama_pos) rs_n_snap[seq_id] && rollback <= (llama_pos) rs_n_valid[seq_id]) {
+                     set_rs_idx(seq_id, (uint32_t) rollback);
+                     cell.pos = p0 - 1;
+                     return true;
+@@ -270,6 +403,13 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
+             tail_dst.tail = tail_src.tail;
+         }
+     }
++
++    // until its first ubatch the destination reads the source cell's planes (src0), so it inherits
++    // what the source's last ubatch wrote
++    if (seq_id_src >= 0 && seq_id_dst >= 0 &&
++            (size_t) seq_id_src < rs_n_valid.size() && (size_t) seq_id_dst < rs_n_valid.size()) {
++        rs_n_valid[seq_id_dst] = rs_n_valid[seq_id_src];
++    }
+ }
+ 
+ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
+@@ -406,6 +546,38 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+     rs_idx[seq_id] = idx;
+ }
+ 
++bool llama_memory_recurrent::seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) {
++    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
++        LLAMA_LOG_ERROR("%s: invalid seq_id (%d) - larger than n_seq_max (%d)\n", __func__, seq_id, n_seq_max);
++        return false;
++    }
++
++    if (n_snap > n_rs_seq) {
++        LLAMA_LOG_ERROR("%s: snapshot budget (%u) larger than n_rs_seq (%u)\n", __func__, n_snap, n_rs_seq);
++        return false;
++    }
++
++    assert(n_seq_max == rs_n_snap.size());
++
++    rs_n_snap[seq_id] = n_snap;
++
++    return true;
++}
++
++void llama_memory_recurrent::set_rs_n_valid(llama_seq_id seq_id, uint32_t n) {
++    if (seq_id < 0) {
++        std::fill(rs_n_valid.begin(), rs_n_valid.end(), n);
++        return;
++    }
++
++    assert(n_seq_max == rs_n_valid.size());
++
++    GGML_ASSERT((uint32_t) seq_id < n_seq_max);
++    GGML_ASSERT(n <= n_rs_seq);
++
++    rs_n_valid[seq_id] = n;
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> ret;
+     for (const auto & [_, buf] : ctxs_bufs) {
+@@ -849,6 +1021,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+ 
+     if (n_rs_seq != 0) {
+         set_rs_idx(seq_id, 0);
++        set_rs_n_valid(seq_id, 0); // a restored cell holds plane 0 only
+     }
+ }
+ 
+@@ -1212,7 +1385,23 @@ bool llama_memory_recurrent_context::apply() {
+         return true;
+     }
+ 
+-    mem->find_slot(ubatches[i_next]);
++    const auto & ubatch = ubatches[i_next];
++
++    mem->find_slot(ubatch);
++
++    // once the graph ran, planes 1..n_valid of every seq in the ubatch hold the states 1..n_valid
++    // tokens back (min(T, K) planes are written, K = 1 + get_n_snap()). Recorded here rather than
++    // in find_slot because prepare() dry-runs find_slot for every ubatch
++    if (mem->n_rs_seq > 0) {
++        const uint32_t n_valid = std::min<uint32_t>(ubatch.n_seq_tokens, 1 + get_n_snap()) - 1;
++
++        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
++            const uint32_t i = s*ubatch.n_seq_tokens;
++            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++                mem->set_rs_n_valid(ubatch.seq_id[i][j], n_valid);
++            }
++        }
++    }
+ 
+     return true;
+ }
+@@ -1270,3 +1459,60 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     }
+     return (int32_t)(idx * mem->size) + src0;
+ }
++
++bool llama_memory_recurrent_context::rs_inplace_ok(uint32_t n_seqs) const {
++    // the reserve context spans the whole cache (head = 0, n_rs = size)
++    if (is_full) {
++        return false;
++    }
++
++    // the extra relocation range [head + n_seqs, head + n_rs) must be empty
++    if (mem->n != n_seqs) {
++        return false;
++    }
++
++    // every ubatch cell must read its own state. After find_slot this holds for
++    // every cell that already owned its state (src0 = src = own index) and for
++    // the one-fresh-seq case where rs_z is the seq's own cell (the graph zeroes
++    // that row before the op reads it). It fails on a seq_cp fan-out, on a cell
++    // reorder and when two fresh seqs share rs_z -- those ubatches take the
++    // gathered path.
++    for (uint32_t i = 0; i < n_seqs; ++i) {
++        const uint32_t cell_idx = mem->head + i;
++        if (mem->cells[cell_idx].src0 != (int32_t) cell_idx) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++uint32_t llama_memory_recurrent_context::get_n_snap() const {
++    // no snapshot planes at all (n_rs_seq == 0): K = 1 regardless of the budgets
++    if (mem->n_rs_seq == 0) {
++        return 0;
++    }
++
++    // the reserve context sizes the compute buffers: keep the largest graph
++    if (is_full || ubatches.empty()) {
++        return mem->n_rs_seq;
++    }
++
++    // ubatches[i_next] is the ubatch apply() -> find_slot just placed; for an equal_seqs ubatch the
++    // seq ids of sequence set s are those of its first token
++    const auto & ubatch = ubatches[i_next];
++
++    uint32_t res = 0;
++
++    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
++        const uint32_t i = s*ubatch.n_seq_tokens;
++        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++            const llama_seq_id seq_id = ubatch.seq_id[i][j];
++            if (seq_id >= 0 && (size_t) seq_id < mem->rs_n_snap.size()) {
++                res = std::max(res, mem->rs_n_snap[seq_id]);
++            }
++        }
++    }
++
++    return res;
++}
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index b13b7b7..21676fa 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -26,7 +26,7 @@ public:
+                      uint32_t   n_rs_seq,
+         const layer_filter_cb & filter);
+ 
+-    ~llama_memory_recurrent() = default;
++    ~llama_memory_recurrent();
+ 
+     //
+     // llama_memory_i
+@@ -44,6 +44,7 @@ public:
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    bool seq_rs_snapshots(llama_seq_id seq_id, uint32_t n_snap) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+@@ -78,6 +79,21 @@ public:
+ 
+     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+ 
++    // per-seq rollback snapshot budget in [0, n_rs_seq] (llama_memory_seq_rs_snapshots): the number
++    // of snapshot planes a ubatch may write for the seq -- the graph writes K = 1 + the max over the
++    // ubatch's seqs (llama_memory_recurrent_context::get_n_snap) -- and the largest partial rollback
++    // seq_rm accepts for it. Defaults to n_rs_seq; only the API changes it (not seq_rm/clear/state_read)
++    std::vector<uint32_t> rs_n_snap;
++
++    // per-seq count of snapshot planes actually written by the seq's last ubatch: planes
++    // 1..rs_n_valid hold the states 1..rs_n_valid tokens back from cell.pos, an older ubatch
++    // left whatever lies beyond. The largest partial rollback seq_rm can honour without reading
++    // a stale plane. Recorded when a ubatch is applied (min(T, K) - 1), copied by seq_cp,
++    // 0 after rm_all / clear / state_read
++    std::vector<uint32_t> rs_n_valid;
++
++    void set_rs_n_valid(llama_seq_id seq_id, uint32_t n); // seq_id < 0: every seq
++
+     // computed before each graph build
+     uint32_t n = 0;
+ 
+@@ -121,6 +137,18 @@ private:
+     // ggml contexts for the KV cache along with the allocated backend buffers:
+     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+ 
++    // host RS buffers backed by an anonymous private mmap (kernel zero pages,
++    // resident only where written) and wrapped with
++    // ggml_backend_cpu_buffer_from_ptr, which does not own the memory: unmapped
++    // in the destructor after the buffers are freed. Empty when
++    // LLAMA_RS_EAGER_ZERO=1 or on non-Linux hosts (eager alloc + memset).
++    struct rs_mmap_region {
++        ggml_backend_buffer_t buf;
++        void *                ptr;
++        size_t                size;
++    };
++    std::vector<rs_mmap_region> mmaps;
++
+     size_t total_size() const;
+ 
+     size_t size_r_bytes() const;
+@@ -173,6 +201,21 @@ public:
+ 
+     int32_t s_copy(int i) const;
+ 
++    // true when the GDN op may update this ubatch's cache rows in place: not the
++    // full (reserve) context, the cell range is exactly the ubatch (n == n_seqs)
++    // and every cell reads its own state (src0 == own index; a pending rollback
++    // still reads a plane of the same cell). Side-effect free on purpose: unlike
++    // s_copy() it never consumes the per-seq rollback index, so it can be
++    // evaluated at graph build and again in can_reuse.
++    bool rs_inplace_ok(uint32_t n_seqs) const;
++
++    // rollback snapshot planes of the current ubatch: the GDN paths write K = 1 + get_n_snap()
++    // state planes per seq. It is the max of the per-seq budgets (mem->rs_n_snap) over the
++    // ubatch's seqs, n_rs_seq for the full (reserve) context so the compute buffers fit the
++    // largest graph, and 0 when the memory keeps no snapshots. Side-effect free (same rule as
++    // rs_inplace_ok): evaluated at graph build and again in can_reuse (part of the reuse key).
++    uint32_t get_n_snap() const;
++
+ private:
+     const llama_memory_status status;
+ 
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index db82539..6407dc4 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -108,6 +108,11 @@ struct llama_memory_i {
+     virtual void clear(bool data) = 0;
+ 
+     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
++
++    // number of rollback snapshot planes the memory may write for / roll back on this sequence
++    // (see llama_memory_seq_rs_snapshots); memories without recurrent state return false
++    virtual bool seq_rs_snapshots(llama_seq_id /*seq_id*/, uint32_t /*n_snap*/) { return false; }
++
+     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+     virtual void seq_keep(llama_seq_id seq_id) = 0;
+     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 191d025..0bc8626 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1287,6 +1287,14 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+             if (name == "output.weight") {
+                 return true; // the output head is built through build_lora_mm in every arch
+             }
++            // MTP draft head (FR-Spec): a K-row copy of output.weight, consumed via build_lora_mm in graph_mtp on the
++            // same rotated path; llama_verify_hadamard_graph still checks the actual graph at context creation.
++            {
++                static const std::string mtp_head = ".nextn.shared_head_head.weight";
++                if (name.size() >= mtp_head.size() && name.compare(name.size() - mtp_head.size(), mtp_head.size(), mtp_head) == 0) {
++                    return true;
++                }
++            }
+             if (name.compare(0, 4, "blk.") != 0) {
+                 return false;
+             }
+@@ -1715,6 +1723,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             if (!layer.nextn.shared_head_head_s && layer.nextn.shared_head_head) {
+                 layer.nextn.shared_head_head_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+             }
++            // MTP restricted draft head (FR-Spec): an optional d2t map [K] next to a K-row nextn.shared_head_head
++            if (layer.nextn.shared_head_head && !d2t) {
++                d2t = create_tensor(tn(LLM_TENSOR_D2T), {layer.nextn.shared_head_head->ne[1]}, TENSOR_NOT_REQUIRED);
++            }
+ 
+             // input scales
+             if (!layer.wq_in_s && layer.wq) {
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ae67400..4aef1ca 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -481,7 +481,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+ 
+     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
+ 
+-    if (cparams.n_rs_seq == 0) {
++    // snapshot planes of this ubatch: K = 1 + the rollback budget of its seqs
++    // (n_rs_seq + 1 when a drafting seq is present, 1 for a ubatch of opted-out
++    // seqs and for a memory without snapshots -- the graph the no-spec context builds)
++    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
++
++    if (K == 1) {
+         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
+         const int64_t s_slot = 0;
+ 
+@@ -503,8 +508,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+         // [TAG_RECURRENT_ROLLBACK_SPLITS]
+         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
+         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
+-
+-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
++        //   (K <= n_rs_seq + 1, so the guarantee covers every budget)
+ 
+         for (int64_t t = 1; t <= K; ++t) {
+             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+@@ -539,7 +543,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         ggml_tensor *        b,
+         ggml_tensor *        s,
+         int                  il,
+-        ggml_tensor *        state_rows) {
++        ggml_tensor *        state_rows,
++        bool                 state_inplace) {
+     const auto * mctx_cur   = inp->mctx;
+     const auto   kv_head    = mctx_cur->get_head();
+     const uint32_t mem_size = mctx_cur->get_size();
+@@ -551,9 +556,56 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t n_seqs       = v->ne[3];
+     const int64_t n_seq_tokens = q->ne[2];
+ 
+-    const bool keep = cparams.n_rs_seq > 0;
++    // snapshot planes of this ubatch (see build_conv_state): every state write
++    // path below derives its plane count from K, so a ubatch of opted-out seqs
++    // (K == 1) touches plane 0 only -- also on the prompt ubatch and on the
++    // gathered transition path
++    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
++
++    const bool keep = K > 1;
++
++    GGML_ASSERT(state_rows == nullptr || keep || state_inplace); // Metal rows mode is a ring-path optimization
++    GGML_ASSERT(!state_inplace || state_rows != nullptr);
++
++    if (state_inplace) {
++        // in-place mode (CPU): the cache-writing op reads each seq's state at
++        // cache row state_rows[seq] (rows_in = inp->s_copy_main: the live row, or
++        // the rollback plane of the same cell), updates the live row
++        // write_rows[seq] in place and writes snapshot slots 1..min(T, K)-1
++        // straight into cache rows write_rows[slot*n_seqs + seq] -- the same
++        // rows the SET_ROWS / strided cpy below would have written. The result
++        // carries the attention scores only: no gather, no dst state planes, no
++        // write-back copy. Same float instruction sequence on the same inputs as
++        // the paths below, so the outputs and the resulting cache rows are
++        // bit-identical (tests/test-gdn-inplace.cpp). With K == 1 the kernel
++        // writes no snapshot rows at all.
++        const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
++        ggml_tensor * gg = raw ? gdn_raw_alpha : g;
++        ggml_tensor * bb = raw ? gdn_raw_beta  : b;
++
++        ggml_tensor * write_rows = build_rs_write_rows(inp, K, n_seq_tokens, n_seqs);
+ 
+-    GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
++        ggml_tensor * gdn_out = ggml_gated_delta_net_cache(ctx0, q, k, v, gg, bb, s, state_rows, write_rows,
++                (int) K, (int) mem_size);
++        if (raw) {
++            ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
++        }
++        if (n_seq_tokens > 1) {
++            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
++        } else {
++            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
++        }
++
++        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
++            S_v, H_v, n_seq_tokens, n_seqs,
++            ggml_row_size(gdn_out->type, S_v),
++            ggml_row_size(gdn_out->type, S_v * H_v),
++            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
++            0);
++        cb(output, "attn_output", il);
++
++        return output;
++    }
+ 
+     if (!keep) {
+         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
+@@ -571,7 +623,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     }
+ 
+     const int64_t D = S_v * S_v * H_v;
+-    const int64_t K = cparams.n_rs_seq + 1;
+ 
+     const bool raw = gdn_raw_beta && gdn_raw_alpha && gdn_raw_dt_bias && gdn_raw_a;
+     ggml_tensor * gg = raw ? gdn_raw_alpha : g;
+diff --git a/src/models/models.h b/src/models/models.h
+index a821330..1ae68a2 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -84,6 +84,10 @@ struct llm_build_delta_net_base : public llm_graph_context {
+     // live state directly at cache row state_rows[seq] (inp->s_copy_main) --
+     // no gathered scratch; the snapshot write becomes a SET_ROWS the Metal
+     // backend can fold into the fused op's epilogue.
++    // state_inplace (CPU only, requires state_rows): the cache-writing op
++    // ggml_gated_delta_net_cache updates the live rows in place and writes the
++    // snapshot slots straight into the cache -- no dst state planes, no SET_ROWS,
++    // no write-back cpy. Only valid on ubatches with inp->rs_inplace.
+     // set per layer before build_recurrent_attn: the fused GDN op then receives the
+     // pre-activation beta / alpha and folds sigmoid / softplus into its prologue
+     // (ggml_gated_delta_net_set_raw_gates); the non-fused paths keep the activated g / b
+@@ -102,7 +106,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+             ggml_tensor *        b,
+             ggml_tensor *        s,
+             int                  il,
+-            ggml_tensor *        state_rows = nullptr);
++            ggml_tensor *        state_rows = nullptr,
++            bool                 state_inplace = false);
+ };
+ 
+ struct llm_build_rwkv6_base : public llm_graph_context {
+@@ -2267,8 +2272,9 @@ struct llama_model_qwen35 : public llama_model_base {
+         graph(const llama_model & model, const llm_graph_params & params);
+ 
+         // device-dependent path choices, scanned once per graph build (not per layer)
+-        bool gdn_state_rows_dev_ok = true; // every GPU device is Metal: fused GDN may read state rows in place
+-        bool gdn_raw_gates_dev_ok  = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
++        bool gdn_state_rows_dev_ok    = true; // every GPU device is Metal: fused GDN may read state rows in place
++        bool gdn_state_inplace_dev_ok = true; // no GPU/IGPU device at all: the in-place (cache-writing) GDN is CPU-only
++        bool gdn_raw_gates_dev_ok     = true; // every device is CPU/Metal/CUDA/ROCm/MUSA: fused GDN takes raw gates
+     private:
+         ggml_tensor * build_layer_attn(
+         llm_graph_input_attn_kv * inp_attn,
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index c5f816e..ba6e09e 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -1,5 +1,6 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
++#include "llama-impl.h"   // llama_mul_mat_hadamard
+ 
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+@@ -115,7 +116,15 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+         layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              mtp_flags);
+         layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              mtp_flags);
+         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
++        {
++            // FR-Spec: a restricted draft head has K rows (K = length of the d2t map in the file); size it from the file.
++            const struct ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
++            const int64_t n_head_vocab = d2t_meta ? d2t_meta->ne[0] : n_vocab;
++            layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_head_vocab }, mtp_flags|TENSOR_NOT_REQUIRED);
++            if (d2t_meta && layer.nextn.shared_head_head && !d2t) {
++                d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_head_vocab }, mtp_flags|TENSOR_NOT_REQUIRED);
++            }
++        }
+         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
+     };
+ 
+@@ -149,13 +158,18 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
+         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ldev.dev);
+         const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+         if (reg_name == nullptr) {
+-            gdn_state_rows_dev_ok = false;
+-            gdn_raw_gates_dev_ok  = false;
++            gdn_state_rows_dev_ok    = false;
++            gdn_state_inplace_dev_ok = false;
++            gdn_raw_gates_dev_ok     = false;
+             break;
+         }
+         // integrated GPUs (e.g. unified-memory CUDA devices) report IGPU, not GPU
+         const bool is_gpu = ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                             ggml_backend_dev_type(ldev.dev) == GGML_BACKEND_DEVICE_TYPE_IGPU;
++        if (is_gpu) {
++            // the cache-writing GDN op mutates one of its sources; only the CPU backend implements it
++            gdn_state_inplace_dev_ok = false;
++        }
+         if (is_gpu && strcmp(reg_name, "MTL") != 0) {
+             gdn_state_rows_dev_ok = false;
+         }
+@@ -472,18 +486,47 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+ 
+     // ring path: read per-seq live state directly from the cache inside the
+     // fused GDN op (rows mode) instead of a gather per layer.
+-    // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B).
+-    // rows mode (the src[6] variant) is implemented on CPU and Metal only;
+-    // other GPU backends reject it in supports_op, which would silently move
+-    // the whole recurrent op to CPU -- keep the gathered form unless every
+-    // GPU device in the model is Metal.
++    // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B) for both
++    // rows modes below.
++    //  - in-place (CPU only, ggml_gated_delta_net_cache): the op updates the
++    //    cache rows themselves -- no gather, no dst state planes, no write-back.
++    //    Taken on every ubatch whose sequences all read their own cell
++    //    (inp->rs_inplace); transition ubatches (a seq joins / leaves / is
++    //    copied / reordered) fall back to the gathered path, which is exact and
++    //    ordering-safe. Part of the graph reuse key (can_reuse_rs).
++    //  - Metal rows + SET_ROWS (the src[6] variant, ring path only): kept for
++    //    machines whose GPU devices are all Metal; other GPU backends reject it
++    //    in supports_op, which would silently move the whole recurrent op to CPU.
+     static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
+ 
+-    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
++    // snapshot planes of this ubatch: K = n_rs_seq + 1 when a drafting seq is in
++    // it, 1 for a ubatch of opted-out seqs (llama_memory_seq_rs_snapshots) and
++    // for a context without snapshots. Keyed on K rather than cparams.n_rs_seq
++    // so an opted-out ubatch builds node for node the graph the no-spec context
++    // builds (single conv-state copy, plane 0 only, fused gates by the probes).
++    const int64_t K = 1 + (int64_t) inp->rs_n_snap;
++
++    // the in-place op always runs the fused kernel: only take it where the legacy
++    // path runs the fused kernel too (the ring path always does; the K == 1 path
++    // only with the fused_gdn_* probes on), so the A/B stays bit-identical
++    const bool fused_ok = K > 1 || (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
++
++    // GGML_GDN_INPLACE_K1_ONLY=1 restricts the in-place path to K == 1 (no
++    // speculation); by default the MTP speculative mode (K = n_rs_seq + 1) takes
++    // it too: slot 0 is updated in place, slots 1..K-1 are written straight into
++    // the snapshot planes of the same cell, and a pending rollback reads plane
++    // rs_idx of the same cell (rows_in != rows_out: copy-then-in-place).
++    static const bool gdn_inplace_k1_only_env = getenv("GGML_GDN_INPLACE_K1_ONLY") != nullptr;
++
++    const bool gdn_state_inplace    = gdn_state_rows_env && gdn_state_inplace_dev_ok && inp->rs_inplace && fused_ok &&
++                                      (K == 1 || !gdn_inplace_k1_only_env);
++    const bool gdn_state_rows_metal = gdn_state_rows_env && gdn_state_rows_dev_ok && !gdn_state_inplace_dev_ok &&
++                                      K > 1;
++    const bool gdn_state_rows       = gdn_state_inplace || gdn_state_rows_metal;
+ 
+     ggml_tensor * state;
+     if (gdn_state_rows) {
+-        state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++        state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, gdn_state_inplace);
+         cb(state, "state_cache_view", il);
+     } else {
+         state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+@@ -560,7 +603,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     cb(v_conv, "v_conv_predelta", il);
+ 
+     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
+-            gdn_state_rows ? inp->s_copy_main : nullptr);
++            gdn_state_rows ? inp->s_copy_main : nullptr, gdn_state_inplace);
+ 
+     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
+     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+@@ -634,6 +677,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+ 
+         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
++
++        // a Hadamard-latent embedding table stores rotated rows; restore the
++        // primal basis right after the lookup: h = s * (H z). The main graph does
++        // this in llm_graph_context::build_inp_embd(); this graph has its own lookup
++        // and must do the same or llama_verify_hadamard_graph rejects the context.
++        if (hadamard_inverses) {
++            const auto it = hadamard_inverses->find(tok_embd_w);
++            if (it != hadamard_inverses->end()) {
++                tok_embd = llama_mul_mat_hadamard(ctx0, tok_embd, it->second.rot);
++                if (it->second.signs) {
++                    tok_embd = ggml_mul(ctx0, tok_embd, it->second.signs);
++                }
++            }
++        }
+     } else {
+         tok_embd = inp->embd;
+     }
+@@ -750,6 +807,20 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+     cur = build_lora_mm(head_w, cur, head_s);
++    // FR-Spec scatter: a restricted draft head produces K logits; place them at their target ids in a
++    // -inf-filled full-vocab vector so the sampler/verifier see a normal [n_vocab] row (EAGLE-3 pattern).
++    if (layer.nextn.shared_head_head && model.d2t) {
++        const int64_t n_draft_vocab = cur->ne[0];
++        const int64_t n_outputs_mtp = cur->ne[1];
++        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
++        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
++        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
++        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs_mtp), -INFINITY);
++        cur = ggml_set_rows(ctx0, full,
++                ggml_reshape_3d(ctx0, cur,        1,             n_draft_vocab, n_outputs_mtp),
++                ggml_reshape_3d(ctx0, model.d2t,  n_draft_vocab, 1,             1));
++        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs_mtp);
++    }
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 67ff970..17aca7d 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -169,6 +169,11 @@ endif ()
+ 
+ llama_build(test-recurrent-state-rollback.cpp)
+ 
++# byte-for-byte check of the cache-writing GDN op (ggml_gated_delta_net_cache)
++# against the legacy gathered and rows+set_rows paths; CPU only, tiny synthetic
++# shapes, no model needed
++llama_build_and_test(test-gdn-inplace.cpp)
++
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+     llama_build_and_test(test-unicode.cpp)
+diff --git a/tests/test-gdn-inplace.cpp b/tests/test-gdn-inplace.cpp
+new file mode 100644
+index 0000000..5e1cc5a
+--- /dev/null
++++ b/tests/test-gdn-inplace.cpp
+@@ -0,0 +1,490 @@
++// Byte-for-byte check of the cache-writing GDN op (ggml_gated_delta_net_cache)
++// against the two legacy paths the graph used to emit, on identical inputs:
++//
++//   A (gathered): ggml_get_rows(cache, rows_in) -> ggml_gated_delta_net(K)
++//                 -> write-back cpy of the min(T, K) state planes into the
++//                 cache rows slot*mem_size + head + seq
++//                 (src/models/delta-net-base.cpp, !keep and keep/gathered)
++//   B (rows):     ggml_gated_delta_net_rows(cache view, rows_in, K)
++//                 -> ggml_set_rows(cache, snapshots, write_rows)
++//                 (the Metal rows mode)
++//   C (in-place): ggml_gated_delta_net_cache(cache view, rows_in, write_rows, K)
++//                 -- the state never leaves the cache
++//
++// For every case the attention scores of C must equal A and B byte for byte
++// and the WHOLE cache tensor after C must equal the cache after A and after
++// B byte for byte (touched rows identical, untouched rows untouched).
++//
++// Matrix: K in {1, 3}, T in {1, 3}, n_seqs in {1, 4, 8}, rows_in in plane 0
++// (identity: rows_in == rows_out) and in plane r in 1..K-1 (rollback read of
++// the same cell), raw gates on/off, H_k == H_v and H_k == H_v/2, 1 and 4
++// threads. KDA (vector gate) off, as in the qwen35 graph.
++//
++// Two extra families cover the per-sequence snapshot budget
++// (llama_memory_seq_rs_snapshots), where a ubatch of opted-out seqs runs with
++// K = 1 while the cache still holds n_rs_seq + 1 planes:
++//
++//   - K = 1 with rows_in in plane r in {1, 2} of a (r + 1)-plane cache: an
++//     opted-out request launched on a slot that inherited a pending rollback
++//     index from a previous drafting request. C must read plane r and write
++//     plane 0 only, byte for byte like A and B.
++//   - T = 1 cross-K: on identical inputs and a 3-plane cache, C with K = 1 and
++//     C with K = 3 must leave byte-identical scores and cache -- a T = 1
++//     ubatch writes plane 0 only, so an opted-out seq sharing a T = 1 ubatch
++//     with a drafting seq (K = 3, the mixed step with an empty draft) gets
++//     exactly the K = 1 result.
++//
++// CPU only; runs on tiny synthetic shapes (S_v = 32, H_v = 4) and needs no
++// model.
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++struct gdn_case {
++    int64_t S_v;
++    int64_t H_v;
++    int64_t H_k;
++    int64_t T;
++    int64_t n_seqs;
++    int64_t K;
++    int64_t n_planes;  // planes allocated in the cache (>= K and > r_in; the memory holds n_rs_seq + 1 whatever K is)
++    int64_t mem_size;
++    int64_t head;
++    int64_t r_in;      // plane read for every seq: rows_in[i] = r_in*mem_size + head + i
++    bool    raw_gates;
++    int     n_threads;
++};
++
++// deterministic input set shared by the three paths
++struct gdn_inputs {
++    std::vector<float> q, k, v, g, beta, dt_bias, a, cache;
++    std::vector<int32_t> rows_in;
++    std::vector<int64_t> rows_out;
++};
++
++static gdn_inputs make_inputs(const gdn_case & c, uint32_t seed) {
++    std::mt19937 rng(seed);
++    auto fill = [&](std::vector<float> & dst, size_t n, float lo, float hi) {
++        std::uniform_real_distribution<float> d(lo, hi);
++        dst.resize(n);
++        for (size_t i = 0; i < n; ++i) {
++            dst[i] = d(rng);
++        }
++    };
++
++    const int64_t D      = c.S_v * c.S_v * c.H_v;
++    const int64_t n_rows = c.mem_size * c.n_planes;
++
++    gdn_inputs in;
++    fill(in.q,    c.S_v * c.H_k * c.T * c.n_seqs, -1.0f, 1.0f);
++    fill(in.k,    c.S_v * c.H_k * c.T * c.n_seqs, -1.0f, 1.0f);
++    fill(in.v,    c.S_v * c.H_v * c.T * c.n_seqs, -1.0f, 1.0f);
++    if (c.raw_gates) {
++        // pre-activation: g -> a[h]*softplus(g + dt_bias[h]), beta -> sigmoid(beta)
++        fill(in.g,       c.H_v * c.T * c.n_seqs, -2.0f, 2.0f);
++        fill(in.beta,    c.H_v * c.T * c.n_seqs, -3.0f, 3.0f);
++        fill(in.dt_bias, c.H_v,                  -1.0f, 1.0f);
++        fill(in.a,       c.H_v,                  -1.0f, -0.1f);
++    } else {
++        // activated: g = log decay in (-2, 0), beta in (0, 1)
++        fill(in.g,    c.H_v * c.T * c.n_seqs, -2.0f, 0.0f);
++        fill(in.beta, c.H_v * c.T * c.n_seqs,  0.0f, 1.0f);
++    }
++    // every row of every plane is random so a wrong row read/write shows up
++    fill(in.cache, D * n_rows, -1.0f, 1.0f);
++
++    in.rows_in.resize(c.n_seqs);
++    for (int64_t i = 0; i < c.n_seqs; ++i) {
++        in.rows_in[i] = (int32_t) (c.r_in * c.mem_size + c.head + i);
++    }
++
++    // set_input_rs mapping: row of (slot s, seq i) = s*mem_size + head + i
++    const int64_t n_write = std::min(c.T, c.K);
++    in.rows_out.resize(n_write * c.n_seqs);
++    for (int64_t r = 0; r < n_write * c.n_seqs; ++r) {
++        in.rows_out[r] = (r / c.n_seqs) * c.mem_size + c.head + (r % c.n_seqs);
++    }
++
++    return in;
++}
++
++struct gdn_tensors {
++    ggml_tensor * q;
++    ggml_tensor * k;
++    ggml_tensor * v;
++    ggml_tensor * g;
++    ggml_tensor * beta;
++    ggml_tensor * dt_bias;
++    ggml_tensor * a;
++    ggml_tensor * cache;     // 2D [D, mem_size*n_planes]
++    ggml_tensor * rows_in;   // I32 [n_seqs]
++    ggml_tensor * rows_out;  // I64 [min(T,K)*n_seqs]
++};
++
++static gdn_tensors make_tensors(ggml_context * ctx, const gdn_case & c, const gdn_inputs & in) {
++    const int64_t D      = c.S_v * c.S_v * c.H_v;
++    const int64_t n_rows = c.mem_size * c.n_planes;
++
++    gdn_tensors t;
++    t.q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c.S_v, c.H_k, c.T, c.n_seqs);
++    t.k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c.S_v, c.H_k, c.T, c.n_seqs);
++    t.v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c.S_v, c.H_v, c.T, c.n_seqs);
++    t.g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,     c.H_v, c.T, c.n_seqs);
++    t.beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,     c.H_v, c.T, c.n_seqs);
++    t.dt_bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.H_v);
++    t.a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.H_v);
++    t.cache   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_rows); // 2D [D, mem_size*n_planes]
++    t.rows_in  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, c.n_seqs);
++    t.rows_out = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, (int64_t) in.rows_out.size());
++
++    memcpy(t.q->data,     in.q.data(),     ggml_nbytes(t.q));
++    memcpy(t.k->data,     in.k.data(),     ggml_nbytes(t.k));
++    memcpy(t.v->data,     in.v.data(),     ggml_nbytes(t.v));
++    memcpy(t.g->data,     in.g.data(),     ggml_nbytes(t.g));
++    memcpy(t.beta->data,  in.beta.data(),  ggml_nbytes(t.beta));
++    if (c.raw_gates) {
++        memcpy(t.dt_bias->data, in.dt_bias.data(), ggml_nbytes(t.dt_bias));
++        memcpy(t.a->data,       in.a.data(),       ggml_nbytes(t.a));
++    } else {
++        memset(t.dt_bias->data, 0, ggml_nbytes(t.dt_bias));
++        memset(t.a->data,       0, ggml_nbytes(t.a));
++    }
++    memcpy(t.cache->data,    in.cache.data(),    ggml_nbytes(t.cache));
++    memcpy(t.rows_in->data,  in.rows_in.data(),  ggml_nbytes(t.rows_in));
++    memcpy(t.rows_out->data, in.rows_out.data(), ggml_nbytes(t.rows_out));
++
++    return t;
++}
++
++static ggml_context * new_ctx() {
++    ggml_init_params params = {
++        /*.mem_size   =*/ 64u * 1024u * 1024u,
++        /*.mem_buffer =*/ nullptr,
++        /*.no_alloc   =*/ false,
++    };
++    ggml_context * ctx = ggml_init(params);
++    if (!ctx) {
++        fprintf(stderr, "ggml_init failed\n");
++        exit(1);
++    }
++    return ctx;
++}
++
++struct path_result {
++    std::vector<uint8_t> attn;   // attention scores, S_v*H_v*T*n_seqs floats
++    std::vector<uint8_t> cache;  // whole cache tensor after the graph ran
++};
++
++static void snapshot(path_result & r, const ggml_tensor * attn_src, size_t attn_bytes, const ggml_tensor * cache) {
++    r.attn.resize(attn_bytes);
++    memcpy(r.attn.data(), attn_src->data, attn_bytes);
++    r.cache.resize(ggml_nbytes(cache));
++    memcpy(r.cache.data(), cache->data, ggml_nbytes(cache));
++}
++
++// A: gathered legacy path, exactly as build_recurrent_attn's !keep (K == 1)
++//    and keep/gathered (K > 1) branches emit it
++static path_result run_gathered(const gdn_case & c, const gdn_inputs & in) {
++    ggml_context * ctx = new_ctx();
++    gdn_tensors t = make_tensors(ctx, c, in);
++
++    const int64_t D = c.S_v * c.S_v * c.H_v;
++    const int64_t attn_score_elems    = c.S_v * c.H_v * c.T * c.n_seqs;
++    const int64_t state_size_per_snap = D * c.n_seqs;
++    const int64_t n_written = std::min(c.T, c.K);
++    const size_t  row_size  = D * sizeof(float);
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++
++    // build_rs main gather (identity or rollback plane) -> 4D state
++    ggml_tensor * gathered = ggml_get_rows(ctx, t.cache, t.rows_in);
++    ggml_tensor * s4d      = ggml_reshape_4d(ctx, gathered, c.S_v, c.S_v, c.H_v, c.n_seqs);
++
++    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, t.q, t.k, t.v, t.g, t.beta, s4d, c.K);
++    if (c.raw_gates) {
++        ggml_gated_delta_net_set_raw_gates(gdn_out, t.dt_bias, t.a);
++    }
++
++    if (c.K == 1) {
++        // build_delta_net_fused new_state view + ggml_cpy into rows [head, head + n_seqs)
++        ggml_tensor * new_state = ggml_view_4d(ctx, gdn_out,
++                c.S_v, c.S_v, c.H_v, c.n_seqs,
++                ggml_row_size(gdn_out->type, c.S_v),
++                ggml_row_size(gdn_out->type, c.S_v * c.S_v),
++                ggml_row_size(gdn_out->type, c.S_v * c.S_v * c.H_v),
++                ggml_row_size(gdn_out->type, c.S_v * c.H_v * c.T * c.n_seqs));
++        ggml_build_forward_expand(gf,
++                ggml_cpy(ctx, new_state,
++                    ggml_view_2d(ctx, t.cache, D, c.n_seqs, t.cache->nb[1], c.head * row_size)));
++    } else {
++        // strided 3D cpy: snapshot slot s -> plane s of the cache at head
++        ggml_tensor * src = ggml_view_3d(ctx, gdn_out,
++            D, c.n_seqs, n_written,
++            ggml_row_size(gdn_out->type, D),
++            ggml_row_size(gdn_out->type, state_size_per_snap),
++            ggml_row_size(gdn_out->type, attn_score_elems));
++        ggml_tensor * dst = ggml_view_3d(ctx, t.cache,
++            D, c.n_seqs, n_written,
++            t.cache->nb[1],
++            (size_t) c.mem_size * row_size,
++            (size_t) c.head * row_size);
++        ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
++    }
++
++    if (ggml_graph_compute_with_ctx(ctx, gf, c.n_threads) != GGML_STATUS_SUCCESS) {
++        fprintf(stderr, "gathered graph compute failed\n");
++        exit(1);
++    }
++
++    path_result r;
++    snapshot(r, gdn_out, attn_score_elems * sizeof(float), t.cache);
++    ggml_free(ctx);
++    return r;
++}
++
++// B: rows mode + SET_ROWS, exactly as the keep/rows branch emits it
++static path_result run_rows(const gdn_case & c, const gdn_inputs & in) {
++    ggml_context * ctx = new_ctx();
++    gdn_tensors t = make_tensors(ctx, c, in);
++
++    const int64_t D = c.S_v * c.S_v * c.H_v;
++    const int64_t attn_score_elems = c.S_v * c.H_v * c.T * c.n_seqs;
++    const int64_t n_written = std::min(c.T, c.K);
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++
++    ggml_tensor * gdn_out = ggml_gated_delta_net_rows(ctx, t.q, t.k, t.v, t.g, t.beta, t.cache, t.rows_in, (int) c.K);
++    if (c.raw_gates) {
++        ggml_gated_delta_net_set_raw_gates(gdn_out, t.dt_bias, t.a);
++    }
++
++    ggml_tensor * snaps = ggml_view_2d(ctx, gdn_out,
++        D, n_written * c.n_seqs,
++        ggml_row_size(gdn_out->type, D),
++        ggml_row_size(gdn_out->type, attn_score_elems));
++
++    ggml_build_forward_expand(gf, ggml_set_rows(ctx, t.cache, snaps, t.rows_out));
++
++    if (ggml_graph_compute_with_ctx(ctx, gf, c.n_threads) != GGML_STATUS_SUCCESS) {
++        fprintf(stderr, "rows graph compute failed\n");
++        exit(1);
++    }
++
++    path_result r;
++    snapshot(r, gdn_out, attn_score_elems * sizeof(float), t.cache);
++    ggml_free(ctx);
++    return r;
++}
++
++// C: the cache-writing op
++static path_result run_inplace(const gdn_case & c, const gdn_inputs & in) {
++    ggml_context * ctx = new_ctx();
++    gdn_tensors t = make_tensors(ctx, c, in);
++
++    const int64_t attn_score_elems = c.S_v * c.H_v * c.T * c.n_seqs;
++
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++
++    ggml_tensor * gdn_out = ggml_gated_delta_net_cache(ctx, t.q, t.k, t.v, t.g, t.beta, t.cache,
++            t.rows_in, t.rows_out, (int) c.K, (int) c.mem_size);
++    if (c.raw_gates) {
++        ggml_gated_delta_net_set_raw_gates(gdn_out, t.dt_bias, t.a);
++    }
++
++    if (ggml_nelements(gdn_out) != attn_score_elems) {
++        fprintf(stderr, "in-place result carries %lld elements, expected scores only (%lld)\n",
++                (long long) ggml_nelements(gdn_out), (long long) attn_score_elems);
++        exit(1);
++    }
++
++    ggml_build_forward_expand(gf, gdn_out);
++
++    if (ggml_graph_compute_with_ctx(ctx, gf, c.n_threads) != GGML_STATUS_SUCCESS) {
++        fprintf(stderr, "in-place graph compute failed\n");
++        exit(1);
++    }
++
++    path_result r;
++    snapshot(r, gdn_out, attn_score_elems * sizeof(float), t.cache);
++    ggml_free(ctx);
++    return r;
++}
++
++static size_t count_diff(const std::vector<uint8_t> & a, const std::vector<uint8_t> & b) {
++    if (a.size() != b.size()) {
++        return std::max(a.size(), b.size());
++    }
++    size_t n = 0;
++    for (size_t i = 0; i < a.size(); ++i) {
++        n += a[i] != b[i];
++    }
++    return n;
++}
++
++// the in-place op must have changed the live rows (the check is not vacuous)
++static bool cache_touched(const gdn_inputs & in, const path_result & r) {
++    std::vector<uint8_t> cache0((const uint8_t *) in.cache.data(),
++                                (const uint8_t *) in.cache.data() + in.cache.size() * sizeof(float));
++    return count_diff(r.cache, cache0) != 0;
++}
++
++// C vs A and B on one input set
++static bool run_abc(const gdn_case & c, const gdn_inputs & in, const char * tag) {
++    const path_result A = run_gathered(c, in);
++    const path_result B = run_rows(c, in);
++    const path_result C = run_inplace(c, in);
++
++    const size_t d_attn_A  = count_diff(C.attn,  A.attn);
++    const size_t d_attn_B  = count_diff(C.attn,  B.attn);
++    const size_t d_cache_A = count_diff(C.cache, A.cache);
++    const size_t d_cache_B = count_diff(C.cache, B.cache);
++
++    const bool touched = cache_touched(in, C);
++
++    const bool ok = d_attn_A == 0 && d_attn_B == 0 && d_cache_A == 0 && d_cache_B == 0 && touched;
++
++    printf("%sK=%lld T=%lld n_seqs=%lld r_in=%lld raw=%d H_k=%lld nth=%d : attn diff A/B = %zu/%zu, "
++           "cache diff A/B = %zu/%zu, cache touched = %d -> %s\n",
++           tag, (long long) c.K, (long long) c.T, (long long) c.n_seqs, (long long) c.r_in, (int) c.raw_gates,
++           (long long) c.H_k, c.n_threads,
++           d_attn_A, d_attn_B, d_cache_A, d_cache_B, (int) touched, ok ? "OK" : "FAIL");
++
++    return ok;
++}
++
++// C with K = 1 vs C with K = 3 on one input set (T = 1, 3-plane cache)
++static bool run_cross_k(const gdn_case & c1, const gdn_inputs & in) {
++    gdn_case c3 = c1;
++    c3.K = 3;
++
++    const path_result C1 = run_inplace(c1, in);
++    const path_result C3 = run_inplace(c3, in);
++
++    const size_t d_attn  = count_diff(C3.attn,  C1.attn);
++    const size_t d_cache = count_diff(C3.cache, C1.cache);
++
++    const bool touched = cache_touched(in, C1);
++
++    const bool ok = d_attn == 0 && d_cache == 0 && touched;
++
++    printf("[cross-K T=1] K=1 vs K=3 n_seqs=%lld r_in=%lld raw=%d H_k=%lld nth=%d : attn diff = %zu, "
++           "cache diff = %zu, cache touched = %d -> %s\n",
++           (long long) c1.n_seqs, (long long) c1.r_in, (int) c1.raw_gates, (long long) c1.H_k, c1.n_threads,
++           d_attn, d_cache, (int) touched, ok ? "OK" : "FAIL");
++
++    return ok;
++}
++
++int main() {
++    const int64_t S_v = 32;
++    const int64_t H_v = 4;
++
++    int n_cases  = 0;
++    int n_failed = 0;
++    uint32_t seed = 1234;
++
++    for (int64_t K : { (int64_t) 1, (int64_t) 3 }) {
++    for (int64_t T : { (int64_t) 1, (int64_t) 3 }) {
++    for (int64_t n_seqs : { (int64_t) 1, (int64_t) 4, (int64_t) 8 }) {
++    for (int64_t r_in = 0; r_in < K; ++r_in) {
++    for (int raw = 0; raw < 2; ++raw) {
++    for (int64_t H_k : { H_v, H_v / 2 }) {
++    for (int n_threads : { 1, 4 }) {
++        gdn_case c;
++        c.S_v       = S_v;
++        c.H_v       = H_v;
++        c.H_k       = H_k;
++        c.T         = T;
++        c.n_seqs    = n_seqs;
++        c.K         = K;
++        c.n_planes  = K;
++        c.mem_size  = n_seqs + 3; // cells before and after the ubatch stay untouched
++        c.head      = 2;
++        c.r_in      = r_in;
++        c.raw_gates = raw != 0;
++        c.n_threads = n_threads;
++
++        const gdn_inputs in = make_inputs(c, seed++);
++
++        const bool ok = run_abc(c, in, "");
++
++        n_cases  += 1;
++        n_failed += !ok;
++    }}}}}}}
++
++    // K = 1 reading a pending rollback plane r in {1, 2} of an (r + 1)-plane cache:
++    // an opted-out request (budget 0 -> K = 1) launched on a slot whose seq still
++    // carries rs_idx from a previous drafting request (the new prompt extends the
++    // cached one, so no reset). Plane r must be read and plane 0 alone written.
++    for (int64_t T : { (int64_t) 1, (int64_t) 3 }) {
++    for (int64_t n_seqs : { (int64_t) 1, (int64_t) 4, (int64_t) 8 }) {
++    for (int64_t r_in : { (int64_t) 1, (int64_t) 2 }) {
++    for (int raw = 0; raw < 2; ++raw) {
++    for (int64_t H_k : { H_v, H_v / 2 }) {
++    for (int n_threads : { 1, 4 }) {
++        gdn_case c;
++        c.S_v       = S_v;
++        c.H_v       = H_v;
++        c.H_k       = H_k;
++        c.T         = T;
++        c.n_seqs    = n_seqs;
++        c.K         = 1;
++        c.n_planes  = std::max<int64_t>(c.K, r_in + 1);
++        c.mem_size  = n_seqs + 3;
++        c.head      = 2;
++        c.r_in      = r_in;
++        c.raw_gates = raw != 0;
++        c.n_threads = n_threads;
++
++        const gdn_inputs in = make_inputs(c, seed++);
++
++        const bool ok = run_abc(c, in, "[K=1 rollback read] ");
++
++        n_cases  += 1;
++        n_failed += !ok;
++    }}}}}}
++
++    // T = 1 cross-K on a 3-plane cache: the mixed T = 1 ubatch (a drafting seq with
++    // an empty draft next to opted-out seqs) runs with K = 3 and must leave every
++    // seq exactly what K = 1 would have: scores and the whole cache byte-identical.
++    // r_in in {0, 1, 2} covers the steady state and the pending-rollback read.
++    for (int64_t n_seqs : { (int64_t) 1, (int64_t) 4, (int64_t) 8 }) {
++    for (int64_t r_in : { (int64_t) 0, (int64_t) 1, (int64_t) 2 }) {
++    for (int raw = 0; raw < 2; ++raw) {
++    for (int64_t H_k : { H_v, H_v / 2 }) {
++    for (int n_threads : { 1, 4 }) {
++        gdn_case c;
++        c.S_v       = S_v;
++        c.H_v       = H_v;
++        c.H_k       = H_k;
++        c.T         = 1;
++        c.n_seqs    = n_seqs;
++        c.K         = 1;
++        c.n_planes  = 3;
++        c.mem_size  = n_seqs + 3;
++        c.head      = 2;
++        c.r_in      = r_in;
++        c.raw_gates = raw != 0;
++        c.n_threads = n_threads;
++
++        // T = 1: rows_out holds min(T, K)*n_seqs = n_seqs rows for K = 1 and K = 3 alike
++        const gdn_inputs in = make_inputs(c, seed++);
++
++        const bool ok = run_cross_k(c, in);
++
++        n_cases  += 1;
++        n_failed += !ok;
++    }}}}}
++
++    printf("%d cases, %d failed\n", n_cases, n_failed);
++
++    return n_failed == 0 ? 0 : 1;
++}
+diff --git a/tests/test-recurrent-state-rollback.cpp b/tests/test-recurrent-state-rollback.cpp
+index c6f599e..31602a9 100644
+--- a/tests/test-recurrent-state-rollback.cpp
++++ b/tests/test-recurrent-state-rollback.cpp
+@@ -17,10 +17,11 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
+     return llama_init_from_model(model, cparams);
+ }
+ 
+-static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count) {
++// decode tokens[0, count) at positions [pos0, pos0 + count) of seq 0 as one batch, logits for the last
++static bool decode_tokens(llama_context * ctx, const std::vector<llama_token> & tokens, uint32_t count, llama_pos pos0 = 0) {
+     llama_batch batch = llama_batch_init(count, 0, 1);
+-    for (uint32_t pos = 0; pos < count; ++pos) {
+-        common_batch_add(batch, tokens[pos], pos, { 0 }, pos + 1 == count);
++    for (uint32_t i = 0; i < count; ++i) {
++        common_batch_add(batch, tokens[i], pos0 + (llama_pos) i, { 0 }, i + 1 == count);
+     }
+     const bool ok = llama_decode(ctx, batch) == 0;
+     llama_batch_free(batch);
+@@ -39,14 +40,22 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
+ // per-seq token count exceeds n_ubatch: each seq's replay spans several
+ // ubatches while its rollback restore is still pending. Compared against a
+ // reference context that never advanced past the rollback point and decodes
+-// the identical replay batch.
++// the identical replay batch. The reference is restored from each seq's
++// checkpoint taken at the rollback point, so both contexts start the replay
++// from bit-identical bytes and differ only in how the memory reads them
++// (pending snapshot plane vs plane 0). A forward-only reference could not be
++// compared bitwise: an honest rollback target always sits inside a multi-token
++// ubatch of ctx_roll (a ubatch snapshots the state after each of its last
++// min(T, K) - 1 tokens, never the state it started from), and the CPU matmul
++// kernels depend on the ubatch size.
+ static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab) {
+     constexpr uint32_t  n_seqs     = 2;
+     constexpr uint32_t  n_ubatch   = 16;
+     constexpr uint32_t  n_prompt   = 19;
+     constexpr uint32_t  n_rollback = 3;
+     constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
+-    constexpr llama_pos p0         = n_prompt - n_rollback;
++    constexpr llama_pos p0         = n_prompt - n_rollback; // replay start; the rollback lands on the state after p0 - 1
++    constexpr llama_pos p_tail     = p0 - 1;                // the last pre-rollback ubatch [p_tail, n_prompt) has n_rollback + 1 tokens
+ 
+     const auto make_ctx_multi = [&]() {
+         auto cparams = common_context_params_to_llama(params);
+@@ -83,18 +92,21 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
+ 
+     bool ok = true;
+ 
+-    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
+-    // the tail, which is then rolled back so its restore is pending at replay
++    // ctx_roll decodes [0, p_tail) and then [p_tail, n_prompt) as one ubatch of
++    // n_rollback + 1 tokens, rolled back by n_rollback -- the largest rollback
++    // that ubatch supports: plane n_rollback is the state after position p_tail,
++    // and the restore is pending at replay. ctx_ref receives that same state
++    // through a checkpoint (state_write resolves the pending plane into a plain
++    // plane-0 state)
+     for (uint32_t s = 0; s < n_seqs && ok; ++s) {
+         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+-        for (llama_pos pos = 0; pos < (llama_pos) p0; ++pos) {
++        for (llama_pos pos = 0; pos < p_tail; ++pos) {
+             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+         }
+         ok = ok && llama_decode(ctx_roll, batch) == 0;
+-        ok = ok && llama_decode(ctx_ref,  batch) == 0;
+ 
+         common_batch_clear(batch);
+-        for (llama_pos pos = p0; pos < (llama_pos) n_prompt; ++pos) {
++        for (llama_pos pos = p_tail; pos < (llama_pos) n_prompt; ++pos) {
+             common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+         }
+         ok = ok && llama_decode(ctx_roll, batch) == 0;
+@@ -104,6 +116,12 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
+ 
+         // a second partial removal while one is pending must be refused
+         ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll), (llama_seq_id) s, p0 - 1, -1);
++
++        if (ok) {
++            common_prompt_checkpoint ckpt;
++            ckpt.update_tgt(ctx_roll, (llama_seq_id) s, 0);
++            ckpt.load_tgt(ctx_ref, (llama_seq_id) s, 0);
++        }
+     }
+     if (!ok) {
+         fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);
+@@ -274,7 +292,9 @@ int main(int argc, char ** argv) {
+     const uint32_t  n_tokens     = tokens.size();
+     const llama_pos rollback_pos = (llama_pos) n_tokens - n_rollback;
+ 
+-    // Decode the full prompt on the source, then roll back three positions.
++    // Decode the full prompt on the source as one ubatch (n_ubatch >= n_tokens), then roll back
++    // three positions: a ubatch snapshots the state after each of its last min(T, K) - 1 tokens,
++    // so plane 3 holds the state after position rollback_pos - 1.
+     // Replaying them crosses DSV4's ratio-4 compressor boundary.
+     // Rollback leaves the recurrent memory in a snapshot state (rs_idx != 0).
+     if (!decode_tokens(ctx_src, tokens, n_tokens)) {
+@@ -292,12 +312,14 @@ int main(int argc, char ** argv) {
+     ckpt.load_tgt(ctx_dst, 0, 0);
+ 
+     constexpr float eps = 1e-5f;
+-    std::vector<std::vector<float>> logits_src_replay(n_rollback);
+-    const auto replay_and_compare = [&](const char * mode) {
++    // replay toks[0, n_rollback) one token at a time at positions [pos0, pos0 + n_rollback) on both
++    // contexts and compare the logits; logits_out (optional) keeps the source logits of each step
++    const auto replay_and_compare = [&](const char * mode, const std::vector<llama_token> & toks, llama_pos pos0,
++                                        std::vector<std::vector<float>> * logits_out) {
+         for (uint32_t i = 0; i < n_rollback; ++i) {
+-            const llama_pos pos = rollback_pos + i;
+-            if (!decode_one(ctx_src, tokens[pos], pos) ||
+-                !decode_one(ctx_dst, tokens[pos], pos)) {
++            const llama_pos pos = pos0 + (llama_pos) i;
++            if (!decode_one(ctx_src, toks[i], pos) ||
++                !decode_one(ctx_dst, toks[i], pos)) {
+                 fprintf(stderr, "%s : %s replay failed at position %d\n", __func__, mode, pos);
+                 return false;
+             }
+@@ -309,7 +331,9 @@ int main(int argc, char ** argv) {
+                 return false;
+             }
+ 
+-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
++            if (logits_out != nullptr) {
++                (*logits_out)[i].assign(logits_src, logits_src + n_vocab);
++            }
+             for (int token = 0; token < n_vocab; ++token) {
+                 if (std::fabs(logits_src[token] - logits_dst[token]) > eps) {
+                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
+@@ -320,12 +344,35 @@ int main(int argc, char ** argv) {
+         }
+         return true;
+     };
+-    if (!replay_and_compare("full")) {
++
++    std::vector<std::vector<float>> logits_src_replay(n_rollback);
++    const std::vector<llama_token> toks_replay(tokens.begin() + rollback_pos, tokens.end());
++    if (!replay_and_compare("full", toks_replay, rollback_pos, &logits_src_replay)) {
++        return 1;
++    }
++
++    // Partial-flags checkpoint of a pending rollback. The three single-token replays above wrote
++    // plane 0 only: a ubatch snapshots the state after each of its last min(T, K) - 1 tokens and
++    // never the state it started from, so rolling those positions back again would have to read
++    // planes an older ubatch wrote, and llama_memory_seq_rm refuses that. Extend both sequences
++    // with the same n_rollback + 1 tokens in ONE ubatch instead and roll back n_rollback, the
++    // largest rollback that ubatch supports: plane n_rollback is the state after its first token.
++    // The replay of positions ext_pos + 1 .. ext_pos + n_rollback again crosses DSV4's ratio-4
++    // compressor boundary (n_tokens = n_rs_seq + 1 = 9, n_rollback = 3).
++    const llama_pos ext_pos = (llama_pos) n_tokens;
++    const uint32_t  n_ext   = n_rollback + 1;
++    std::vector<llama_token> ext(n_ext);
++    for (uint32_t i = 0; i < n_ext; ++i) {
++        ext[i] = tokens[(1 + i) % n_tokens];
++    }
++    if (!decode_tokens(ctx_src, ext, n_ext, ext_pos) || !decode_tokens(ctx_dst, ext, n_ext, ext_pos)) {
++        fprintf(stderr, "%s : extension decode failed\n", __func__);
+         return 1;
+     }
+ 
+-    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
+-        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
++    const llama_pos rollback_pos_ext = ext_pos + 1;
++    if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos_ext, -1) ||
++        !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos_ext, -1)) {
+         fprintf(stderr, "%s : partial rollback failed\n", __func__);
+         return 1;
+     }
+@@ -335,7 +382,8 @@ int main(int argc, char ** argv) {
+     ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
+     ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
+ 
+-    if (!replay_and_compare("partial")) {
++    const std::vector<llama_token> toks_ext(ext.begin() + 1, ext.end());
++    if (!replay_and_compare("partial", toks_ext, rollback_pos_ext, nullptr)) {
+         return 1;
+     }
+ 
+diff --git a/tools/server/README.md b/tools/server/README.md
+index 93736c3..ec60c1b 100644
+--- a/tools/server/README.md
++++ b/tools/server/README.md
+@@ -596,6 +596,8 @@ These words will not be included in the completion, so make sure to add them to
+ 
+ `lora`: A list of LoRA adapters to be applied to this specific request. Each object in the list must contain `id` and `scale` fields. For example: `[{"id": 0, "scale": 0.5}, {"id": 1, "scale": 1.1}]`. If a LoRA adapter is not specified in the list, its scale will default to `0.0`. Please note that requests with different LoRA configurations will not be batched together, which may result in performance degradation.
+ 
++`speculative.n_max`: Maximum number of tokens to draft for this request when the server runs a draft-model based speculative decoding method (e.g. `--spec-type draft-mtp`). `0` disables drafting for the request: the slot adds one token per step, decodes in one ubatch together with the other non-drafting slots and keeps a single recurrent-state plane (no rollback snapshots). `0 < n_max < --spec-draft-n-max` truncates the draft; larger values have no effect (the draft stops at the server-wide limit). `LLAMA_SERVER_SPEC_MULTISLOT=0` in the server environment restores the previous policy (the field is ignored and every slot drafts). Default: the server `--spec-draft-n-max`
++
+ **Response format**
+ 
+ - Note: In streaming mode (`stream`), only `content`, `tokens` and `stop` will be returned until end of completion. Responses are sent using the [Server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html) standard. Note: the browser's `EventSource` interface cannot be used due to its lack of `POST` request support.
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9edbd7..db0c0e8 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -212,6 +212,11 @@ struct server_slot {
+     common_prompt_checkpoint spec_ckpt;
+     bool spec_is_replay = false;
+ 
++    // per-request drafting policy, set in launch_slot_with_task from "speculative.n_max"
++    // (LLAMA_SERVER_SPEC_MULTISLOT=0 restores the server-wide policy: every slot drafts, no cap)
++    bool spec_enabled = false; // false: the slot never drafts -> one token per step, single state plane
++    int  spec_n_max   = -1;    // per-request draft cap; < 0: no per-request limit
++
+     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
+     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
+     std::unique_ptr<const server_task> task;
+@@ -441,6 +446,11 @@ struct server_slot {
+             return 0;
+         }
+ 
++        // the request opted out of drafting ("speculative.n_max": 0)
++        if (!spec_enabled) {
++            return 0;
++        }
++
+         // determine the max draft that fits the current slot state
+         // note: slot.prompt is not yet expanded with the `id` token sampled above
+         //       also, need to leave space for 1 extra token to allow context shifts
+@@ -450,6 +460,12 @@ struct server_slot {
+             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+         }
+ 
++        // per-request cap; a request without the field carries the server-wide n_max, at which the
++        // draft implementation stops anyway, so the clamp is a no-op for it
++        if (spec_n_max > 0) {
++            n_draft_max = std::min(n_draft_max, spec_n_max);
++        }
++
+         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
+ 
+         return n_draft_max;
+@@ -862,6 +878,11 @@ private:
+     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
+     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+ 
++    // env: LLAMA_SERVER_SPEC_MULTISLOT (default 1). 0 restores the server-wide speculative policy:
++    // every slot drafts with the global n_max, the per-request "speculative.n_max" is ignored and
++    // every sequence keeps the full rollback snapshot budget
++    bool spec_multislot = true;
++
+     int n_empty_consecutive = 0;
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+@@ -1258,6 +1279,15 @@ private:
+             }
+         }
+ 
++        {
++            const char * LLAMA_SERVER_SPEC_MULTISLOT = getenv("LLAMA_SERVER_SPEC_MULTISLOT");
++            spec_multislot = LLAMA_SERVER_SPEC_MULTISLOT ? atoi(LLAMA_SERVER_SPEC_MULTISLOT) != 0 : true;
++
++            if (!spec_multislot) {
++                SRV_WRN("%s\n", "LLAMA_SERVER_SPEC_MULTISLOT = 0: per-request \"speculative.n_max\" is ignored, every slot drafts");
++            }
++        }
++
+         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
+         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
+         {
+@@ -1719,6 +1749,24 @@ private:
+ 
+         slot.task = std::make_unique<const server_task>(std::move(task));
+ 
++        // per-request drafting policy: "speculative.n_max": 0 opts the request out of speculative
++        // decoding, so the slot adds exactly one token per step and N such slots decode as one
++        // N x 1 ubatch (the shape the no-spec server decodes). A request without the field keeps the
++        // server-wide n_max -> the unchanged drafting path. The schema rejects negative values.
++        {
++            const int n_max_req = slot.task->params.speculative.draft.n_max;
++
++            slot.spec_enabled = slot.can_speculate() && (!spec_multislot || n_max_req != 0);
++            slot.spec_n_max   = spec_multislot ? n_max_req : -1;
++
++            // rollback snapshot budget of the slot's sequence (recurrent memories; a no-op for the
++            // others): every plane for a drafting slot (K = n_rs_seq + 1, the unchanged graph), none
++            // for an opted-out slot (K = 1: plane 0 only, the graph the no-spec server builds). Set
++            // before the slot's first ubatch. The MTP draft context holds a plain KV cache, so the
++            // call goes to ctx_tgt only.
++            llama_memory_seq_rs_snapshots(llama_get_memory(ctx_tgt), slot.id, slot.spec_enabled ? llama_n_rs_seq(ctx_tgt) : 0);
++        }
++
+         slot.state = slot.task->is_child()
+             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
+             : SLOT_STATE_STARTED;
+diff --git a/tools/server/server-schema.cpp b/tools/server/server-schema.cpp
+index 64b9251..dca2dbe 100644
+--- a/tools/server/server-schema.cpp
++++ b/tools/server/server-schema.cpp
+@@ -194,13 +194,17 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
+     // Speculative decoding params
+     //
+ 
+-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
+-#if 0
+-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
++    // per-request draft cap (draft-model based methods). 0 opts the request out of drafting: the
++    // slot then adds exactly one token per step and batches with the other non-drafting slots
++    // (server_slot::spec_enabled). Without the field the request inherits the server-wide
++    // --spec-draft-n-max (params_base), i.e. the unchanged drafting path.
+     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
+         ->set_hard_limits(0, INT32_MAX)
+-        ->set_desc("Maximum number of tokens to draft during speculative decoding"));
++        ->set_desc("Maximum number of tokens to draft during speculative decoding (0 = no drafting for this request)"));
+ 
++    // TODO: to keep things simple, we disable the remaining speculative parameter adjustments for now
++#if 0
++    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
+         ->set_hard_limits(0, INT32_MAX)
+         ->set_desc("Minimum number of draft tokens to use for speculative decoding");
